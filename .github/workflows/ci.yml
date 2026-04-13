@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.10"
+
+      - name: Terraform fmt check
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Terraform validate (docs only)
+        run: |
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+
+      - name: Terraform validate (with graph store enabled)
+        run: |
+          cat > terraform/_ci_graph_on.auto.tfvars <<'EOF'
+          project_id          = "ci-validate"
+          cloudbuild_repo_uri = "https://github.com/example/gcp-hashi-knowledge-base"
+          create_graph_store  = true
+          graph_repo_uris     = ["https://github.com/example/workspace"]
+          EOF
+          terraform -chdir=terraform validate
+          rm terraform/_ci_graph_on.auto.tfvars
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init plugins
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run tflint (root)
+        run: tflint --chdir=terraform --recursive --format compact
+
+  terraform-test:
+    name: terraform test (plan-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.10"
+
+      - name: Init
+        run: terraform -chdir=terraform init -backend=false -input=false
+
+      - name: Run plan-only tests
+        run: terraform -chdir=terraform test
+
+  trivy:
+    name: Trivy security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: terraform/
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        run: |
+          files=$(git ls-files 'scripts/*.sh' 'cloudbuild/scripts/*.sh')
+          if [ -n "$files" ]; then
+            # shellcheck disable=SC2086
+            shellcheck $files
+          fi
+
+  python-tests:
+    name: Python unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          if [ -f cloudbuild/scripts/requirements.txt ]; then
+            pip install -r cloudbuild/scripts/requirements.txt
+          fi
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          if [ -d cloudbuild/scripts/tests ]; then
+            python -m pytest cloudbuild/scripts/tests -v
+          else
+            echo "No tests directory yet — skipping."
+          fi

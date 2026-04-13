@@ -1,0 +1,2 @@
+google-cloud-spanner>=3.47.0
+google-cloud-storage>=2.14.0

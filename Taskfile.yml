@@ -1,0 +1,710 @@
+version: "3"
+
+# Requires: Task (https://taskfile.dev), terraform, gcloud, python3
+#
+# Quick start — provision everything with one command:
+#
+#   task up REPO_URI=https://github.com/org/repo
+#
+# PROJECT_ID is auto-detected from `gcloud config get-value project`.
+# Override with PROJECT_ID=my-project if needed.
+#
+# State and RAG bucket names are derived automatically:
+#   <PROJECT_ID>-tf-state-<8-char hash>
+#   <PROJECT_ID>-rag-docs-<8-char hash>
+#
+# For day-to-day infra changes after initial setup, use the individual tasks below.
+
+vars:
+  TF_DIR: terraform
+  PYTHON: .venv/bin/python3
+  PROJECT_ID:
+    sh: '{{if .PROJECT_ID}}echo "{{.PROJECT_ID}}"{{else}}gcloud config get-value project 2>/dev/null{{end}}'
+  REGION: '{{.REGION | default "us-west1"}}'
+  STATE_BUCKET:
+    sh: 'echo "{{.PROJECT_ID}}-tf-state-$(echo -n "{{.PROJECT_ID}}" | sha256sum | cut -c1-8)"'
+  DISTANCE_THRESHOLD: '{{.DISTANCE_THRESHOLD | default "0.35"}}'
+
+tasks:
+
+  default:
+    desc: "List available tasks"
+    cmds:
+      - task --list
+
+  # ── Authentication ─────────────────────────────────────────────────────────
+
+  login:
+    desc: "Authenticate gcloud and set Application Default Credentials for Terraform"
+    summary: |
+      Runs two auth flows required before any other task:
+
+        1. gcloud auth login          — browser-based login for gcloud CLI commands
+        2. gcloud auth application-default login — sets ADC used by Terraform and the Python scripts
+
+      Sets the active project. PROJECT_ID is auto-detected from gcloud config
+      or can be overridden explicitly.
+
+      Example:
+        task login
+        task login PROJECT_ID=my-project
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    cmds:
+      - gcloud auth login
+      - gcloud auth application-default login
+      - gcloud config set project {{.PROJECT_ID}}
+      - echo "Active project set to {{.PROJECT_ID}}"
+      - echo "Enabling Service Usage API (required bootstrap for Terraform)..."
+      - gcloud services enable serviceusage.googleapis.com --project={{.PROJECT_ID}}
+
+  # ── Primary entrypoint ─────────────────────────────────────────────────────
+
+  up:
+    desc: "Full end-to-end deploy: preflight → bootstrap → apply → pipeline"
+    summary: |
+      Provisions the complete RAG pipeline in a single command. Idempotent —
+      safe to re-run. Each step is skipped automatically if already complete.
+
+      Runs preflight checks first to verify tools, auth, Python packages, repo
+      files, and Terraform validity before touching any infrastructure.
+
+      Steps:
+        0. Preflight checks (tools, auth, Python packages, files, Terraform)
+        1. Create GCS state bucket (skipped if already exists)
+        2. terraform apply (infrastructure + RAG corpus)
+        3. Trigger first pipeline run and wait
+
+      The Vertex AI RAG corpus is created by Terraform as a managed resource
+      (google_vertex_ai_rag_corpus) — no separate corpus creation step needed.
+
+      PROJECT_ID is auto-detected from gcloud config. Override with PROJECT_ID=<id>.
+      Both bucket names are derived automatically from the project ID.
+
+      Required vars: REPO_URI
+      Optional vars: PROJECT_ID, REGION, SKIP_PIPELINE=true
+
+      Example:
+        task up REPO_URI=https://github.com/org/repo
+        task up REPO_URI=https://github.com/org/repo PROJECT_ID=my-project REGION=europe-west1
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    requires:
+      vars: [REPO_URI]
+    cmds:
+      - task: preflight
+      - |
+        scripts/deploy.sh \
+          --project-id {{.PROJECT_ID}} \
+          --region     {{.REGION}}     \
+          --repo-uri   {{.REPO_URI}}   \
+          {{if eq .SKIP_PIPELINE "true"}}--skip-pipeline{{end}}
+
+  # ── Bootstrap (one-time, also called by `up`) ──────────────────────────────
+
+  bootstrap:
+    desc: "One-time: create GCS state bucket and initialise Terraform remote backend"
+    summary: |
+      Creates and configures the GCS bucket used for Terraform state.
+      Called automatically by `task up`; run manually only when setting up
+      a second environment.
+
+      The bucket name is derived automatically: <PROJECT_ID>-tf-state-<8-char hash>
+
+      Example:
+        task bootstrap
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    cmds:
+      - scripts/bootstrap_state.sh --project-id {{.PROJECT_ID}} --region {{.REGION}}
+
+  # ── Terraform core ─────────────────────────────────────────────────────────
+
+  fmt:
+    desc: "Format all Terraform files in-place"
+    cmds:
+      - terraform -chdir={{.TF_DIR}} fmt -recursive
+
+  fmt:check:
+    desc: "Check Terraform formatting without modifying files (CI gate)"
+    cmds:
+      - terraform -chdir={{.TF_DIR}} fmt -check -recursive
+
+  init:
+    desc: "Initialise Terraform with remote backend"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    cmds:
+      - terraform -chdir={{.TF_DIR}} init -backend-config="bucket={{.STATE_BUCKET}}" -input=false
+    status:
+      - test -d {{.TF_DIR}}/.terraform
+
+  init:upgrade:
+    desc: "Re-initialise and upgrade providers"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    cmds:
+      - terraform -chdir={{.TF_DIR}} init -backend-config="bucket={{.STATE_BUCKET}}" -input=false -upgrade
+
+  validate:
+    desc: "Run terraform validate (requires init)"
+    deps: [init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} validate
+
+  plan:
+    desc: "Run terraform plan and save to tfplan"
+    deps: [init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} plan -input=false -out=tfplan
+
+  apply:
+    desc: "Apply the most recent saved plan (requires prior 'task plan')"
+    prompt: "Apply terraform plan to {{.PROJECT_ID}}? This modifies real GCP resources."
+    cmds:
+      - terraform -chdir={{.TF_DIR}} apply tfplan
+
+  destroy:
+    desc: "Destroy all Terraform-managed infrastructure (includes RAG corpus)"
+    deps: [init]
+    prompt: "Destroy ALL infrastructure in {{.PROJECT_ID}}? This is irreversible."
+    cmds:
+      - terraform -chdir={{.TF_DIR}} destroy -auto-approve -input=false
+
+  output:
+    desc: "Show Terraform outputs"
+    deps: [init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} output
+
+  # ── Docs pipeline (Vertex AI RAG) ──────────────────────────────────────────
+
+  corpus:create:
+    desc: "The RAG corpus is now managed by Terraform — run 'task apply' instead"
+    cmds:
+      - echo "The RAG corpus is created by 'terraform apply' (google_vertex_ai_rag_corpus). Run 'task apply'."
+
+  docs:run:
+    desc: "Trigger the docs pipeline (Vertex AI RAG ingestion) and wait for completion"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    deps: [init]
+    vars:
+      CORPUS_ID:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw corpus_resource_name 2>/dev/null | grep -oE "[0-9]+$"'
+      RAG_BUCKET:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw gcs_bucket_name 2>/dev/null'
+      SA_EMAIL:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw service_account_email 2>/dev/null'
+      REPO_URI:
+        sh: 'grep cloudbuild_repo_uri {{.TF_DIR}}/terraform.tfvars 2>/dev/null | cut -d\" -f2'
+    cmds:
+      - |
+        SERVICE_ACCOUNT="projects/{{.PROJECT_ID}}/serviceAccounts/{{.SA_EMAIL}}"
+        WORKFLOW_DATA=$({{.PYTHON}} -c "
+        import json
+        print(json.dumps({
+          'corpus_id':       '{{.CORPUS_ID}}',
+          'bucket_name':     '{{.RAG_BUCKET}}',
+          'region':          '{{.REGION}}',
+          'repo_url':        '{{.REPO_URI}}',
+          'service_account': '${SERVICE_ACCOUNT}',
+        }))
+        ")
+        scripts/run_pipeline.sh --region {{.REGION}} --wait --data "${WORKFLOW_DATA}"
+
+  docs:test:
+    desc: "Run retrieval quality tests against the Vertex AI corpus"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    requires:
+      vars: [CORPUS_ID]
+    cmds:
+      - "{{.PYTHON}} scripts/test_retrieval.py --project-id {{.PROJECT_ID}} --region {{.REGION}} --corpus-id {{.CORPUS_ID}} --distance-threshold {{.DISTANCE_THRESHOLD}}"
+
+  docs:token-efficiency:
+    desc: "Compare token efficiency of RAG retrieval vs raw documentation"
+    summary: |
+      Runs a suite of queries against the RAG corpus and compares the token
+      count of retrieved chunks against the estimated token cost of providing
+      the same information from raw documentation pages.
+
+      Outputs a per-query breakdown and an overall summary showing the token
+      savings achieved by using the RAG corpus.
+
+      Optional: install tiktoken for precise token counting.
+        pip install tiktoken
+
+      Example:
+        task docs:token-efficiency CORPUS_ID=6917529027641081856
+        task docs:token-efficiency CORPUS_ID=6917529027641081856 DISTANCE_THRESHOLD=0.5
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    requires:
+      vars: [CORPUS_ID]
+    cmds:
+      - "{{.PYTHON}} scripts/test_token_efficiency.py --project-id {{.PROJECT_ID}} --region {{.REGION}} --corpus-id {{.CORPUS_ID}} --distance-threshold {{.DISTANCE_THRESHOLD}}"
+
+  # ── Graph pipeline (Spanner Graph) ─────────────────────────────────────────
+
+  graph:populate:
+    desc: "Trigger the Terraform graph pipeline (terraform graph → Spanner) and wait"
+    summary: |
+      Submits a Cloud Workflows execution that fans out per-repo Cloud Build
+      jobs which clone each workspace repo, run `terraform graph`, and ingest
+      the DOT into the Spanner Graph store.
+
+      Requires create_graph_store=true and a non-empty graph_repo_uris list
+      in terraform.tfvars (or passed via terraform apply).
+
+      Example:
+        task graph:populate
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    deps: [init]
+    cmds:
+      - scripts/run_graph_pipeline.sh --project-id {{.PROJECT_ID}} --region {{.REGION}} --wait
+
+  graph:test:
+    desc: "Smoke-test the Spanner graph store (Resource / DependsOn counts)"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    deps: [init]
+    cmds:
+      - scripts/test_graph.sh --project-id {{.PROJECT_ID}}
+
+  graph:status:
+    desc: "Show the last 5 graph pipeline workflow executions"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    deps: [init]
+    vars:
+      WORKFLOW_NAME:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw graph_workflow_name 2>/dev/null'
+    cmds:
+      - |
+        if [ -z "{{.WORKFLOW_NAME}}" ] || [ "{{.WORKFLOW_NAME}}" = "null" ]; then
+          echo "graph_workflow_name output is null. Set create_graph_store=true and apply."
+          exit 1
+        fi
+        gcloud workflows executions list "{{.WORKFLOW_NAME}}" \
+          --project={{.PROJECT_ID}} \
+          --location={{.REGION}} \
+          --limit=5 \
+          --format="table(name.basename(),state,startTime,endTime)"
+
+  # ── Preflight checks ───────────────────────────────────────────────────────
+
+  preflight:
+    desc: "Run all preflight checks: tools, auth, APIs, Python packages"
+    summary: |
+      Validates that the local environment has everything needed to run the
+      pipeline. Checks for required CLI tools, GCP authentication, enabled
+      APIs, Python packages, and repository file structure.
+
+      Run this before `task up` or after setting up a new workstation.
+
+      Example:
+        task preflight
+        task preflight PROJECT_ID=my-project
+    cmds:
+      - task: preflight:tools
+      - task: preflight:auth
+      - task: preflight:python
+      - task: preflight:files
+      - task: preflight:terraform
+      - echo ""
+      - echo "All preflight checks passed."
+
+  preflight:tools:
+    desc: "Check required CLI tools are installed"
+    cmds:
+      - |
+        fail=0
+        for cmd in terraform gcloud python3 pip3 git bash shellcheck jq; do
+          if command -v "$cmd" &>/dev/null; then
+            ver=$("$cmd" --version 2>&1 | head -1)
+            echo "OK: $cmd — $ver"
+          else
+            echo "MISSING: $cmd — install before proceeding"
+            fail=1
+          fi
+        done
+        if [ "$fail" -ne 0 ]; then
+          echo ""
+          echo "Install missing tools and re-run 'task preflight:tools'."
+          exit 1
+        fi
+      - |
+        # Terraform version gate (>= 1.5)
+        tf_ver=$(terraform version -json 2>/dev/null | jq -r '.terraform_version // empty')
+        if [ -z "$tf_ver" ]; then
+          tf_ver=$(terraform version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+        fi
+        major=$(echo "$tf_ver" | cut -d. -f1)
+        minor=$(echo "$tf_ver" | cut -d. -f2)
+        if [ "$major" -ge 2 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 5 ]; }; then
+          echo "OK: Terraform $tf_ver (>= 1.5)"
+        else
+          echo "FAIL: Terraform $tf_ver — need >= 1.5"
+          exit 1
+        fi
+      - |
+        # Python version gate (>= 3.11)
+        py_ver=$({{.PYTHON}} -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        py_major=$(echo "$py_ver" | cut -d. -f1)
+        py_minor=$(echo "$py_ver" | cut -d. -f2)
+        if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 11 ]; then
+          echo "OK: Python $py_ver (>= 3.11)"
+        else
+          echo "FAIL: Python $py_ver — need >= 3.11"
+          exit 1
+        fi
+
+  preflight:auth:
+    desc: "Check GCP authentication and project configuration"
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    cmds:
+      - |
+        # Check gcloud auth
+        acct=$(gcloud auth list --filter="status:ACTIVE" --format="value(account)" 2>/dev/null | head -1)
+        if echo "$acct" | grep -q '@'; then
+          echo "OK: gcloud authenticated as $acct"
+        else
+          echo "FAIL: No active gcloud account. Run 'task login'."
+          exit 1
+        fi
+      - |
+        # Check Application Default Credentials
+        if gcloud auth application-default print-access-token &>/dev/null; then
+          echo "OK: Application Default Credentials configured"
+        else
+          echo "FAIL: ADC not set. Run 'gcloud auth application-default login'."
+          exit 1
+        fi
+      - |
+        # Verify project exists and is accessible
+        if gcloud projects describe {{.PROJECT_ID}} &>/dev/null; then
+          echo "OK: Project {{.PROJECT_ID}} is accessible"
+        else
+          echo "FAIL: Cannot access project {{.PROJECT_ID}}. Check permissions or project ID."
+          exit 1
+        fi
+      - |
+        # Check required APIs are enabled
+        required_apis=(
+          aiplatform.googleapis.com
+          storage.googleapis.com
+          cloudbuild.googleapis.com
+          workflows.googleapis.com
+          cloudscheduler.googleapis.com
+          serviceusage.googleapis.com
+        )
+        enabled=$(gcloud services list --project={{.PROJECT_ID}} --enabled --format="value(config.name)" 2>/dev/null)
+        for api in "${required_apis[@]}"; do
+          if echo "$enabled" | grep -q "^${api}$"; then
+            echo "OK: API $api enabled"
+          else
+            echo "WARN: API $api not yet enabled (Terraform will enable it)"
+            # Not a hard failure — Terraform handles this
+          fi
+        done
+
+  preflight:python:
+    desc: "Check Python packages required by scripts"
+    cmds:
+      - |
+        fail=0
+
+        # Cloud Build script dependencies (from requirements.txt)
+        declare -A pkg_imports=(
+          [pyyaml]=yaml
+          [requests]=requests
+          [pytest]=pytest
+          [beautifulsoup4]=bs4
+        )
+        for pkg in "${!pkg_imports[@]}"; do
+          mod="${pkg_imports[$pkg]}"
+          if {{.PYTHON}} -c "import $mod" 2>/dev/null; then
+            echo "OK: $pkg installed"
+          else
+            echo "MISSING: $pkg"
+            fail=1
+          fi
+        done
+
+        # Vertex AI SDK (needed by scripts/create_corpus.py and scripts/test_retrieval.py)
+        if {{.PYTHON}} -c "from vertexai import rag" 2>/dev/null; then
+          echo "OK: google-cloud-aiplatform installed (vertexai.rag available)"
+        else
+          echo "MISSING: google-cloud-aiplatform"
+          fail=1
+        fi
+
+        if [ "$fail" -ne 0 ]; then
+          echo ""
+          echo "Install missing packages with:"
+          echo "  pip install google-cloud-aiplatform pyyaml requests pytest beautifulsoup4"
+          exit 1
+        fi
+
+  preflight:files:
+    desc: "Check essential repository files are present"
+    cmds:
+      - |
+        fail=0
+        files=(
+          terraform/versions.tf
+          terraform/variables.tf
+          terraform/main.tf
+          terraform/outputs.tf
+          workflows/rag_pipeline.yaml
+          workflows/graph_pipeline.yaml
+          cloudbuild/cloudbuild.yaml
+          cloudbuild/scripts/clone_repos.sh
+          cloudbuild/scripts/discover_modules.py
+          cloudbuild/scripts/process_docs.py
+          cloudbuild/scripts/requirements.txt
+          cloudbuild/scripts/ingest_graph.py
+          cloudbuild/scripts/requirements_graph.txt
+          scripts/create_corpus.py
+          scripts/test_retrieval.py
+          scripts/run_pipeline.sh
+          scripts/run_graph_pipeline.sh
+          scripts/test_graph.sh
+          scripts/setup_claude_vertex.sh
+          scripts/deploy.sh
+          scripts/bootstrap_state.sh
+        )
+        for f in "${files[@]}"; do
+          if [ -f "$f" ]; then
+            echo "OK: $f"
+          else
+            echo "MISSING: $f"
+            fail=1
+          fi
+        done
+
+        # Check shell scripts are executable
+        for sh_file in cloudbuild/scripts/clone_repos.sh scripts/run_pipeline.sh scripts/setup_claude_vertex.sh scripts/deploy.sh scripts/bootstrap_state.sh; do
+          if [ -f "$sh_file" ] && [ ! -x "$sh_file" ]; then
+            echo "WARN: $sh_file is not executable — run 'chmod +x $sh_file'"
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo ""
+          echo "Repository is incomplete. Re-run the build stages for missing files."
+          exit 1
+        fi
+
+  preflight:terraform:
+    desc: "Check Terraform formatting and syntax"
+    cmds:
+      - |
+        if terraform -chdir={{.TF_DIR}} fmt -check -recursive 2>/dev/null; then
+          echo "OK: Terraform formatting"
+        else
+          echo "FAIL: Terraform files need formatting. Run 'task fmt'."
+          exit 1
+        fi
+      - |
+        if terraform -chdir={{.TF_DIR}} init -backend=false -input=false &>/dev/null && \
+           terraform -chdir={{.TF_DIR}} validate &>/dev/null; then
+          echo "OK: Terraform validates"
+        else
+          echo "FAIL: Terraform validation failed. Run 'terraform -chdir={{.TF_DIR}} validate' for details."
+          exit 1
+        fi
+
+  # ── Claude Code integration ────────────────────────────────────────────────
+
+  claude:setup:
+    desc: "Configure Claude Code to use Vertex AI as its backend"
+    summary: |
+      Sets up authentication and environment variables so Claude Code routes
+      requests through your GCP project's Vertex AI endpoint.
+
+      This configures four environment variables:
+        CLAUDE_CODE_USE_VERTEX=1
+        ANTHROPIC_VERTEX_PROJECT_ID=<project>
+        CLOUD_ML_REGION=<region>
+        ANTHROPIC_MODEL=<model>
+
+      After running this task, start Claude Code with `claude` in the same
+      shell and it will use Vertex AI automatically.
+
+      Optional vars:
+        CLAUDE_REGION  — Vertex AI region (default: us-east5)
+        CLAUDE_MODEL   — model ID (default: claude-sonnet-4-20250514)
+        PERSIST=true   — append exports to ~/.bashrc
+
+      Example:
+        task claude:setup
+        task claude:setup CLAUDE_REGION=europe-west1
+        task claude:setup PERSIST=true
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    vars:
+      CLAUDE_REGION: '{{.CLAUDE_REGION | default "us-east5"}}'
+      CLAUDE_MODEL: '{{.CLAUDE_MODEL | default "claude-sonnet-4-20250514"}}'
+    cmds:
+      - |
+        scripts/setup_claude_vertex.sh \
+          --project-id {{.PROJECT_ID}} \
+          --region     {{.CLAUDE_REGION}} \
+          --model      {{.CLAUDE_MODEL}} \
+          {{if eq .PERSIST "true"}}--persist{{end}}
+
+  # ── MCP server ─────────────────────────────────────────────────────────────
+
+  mcp:install:
+    desc: "Install MCP server dependencies into .venv"
+    summary: |
+      Installs the mcp and google-cloud-aiplatform packages required by
+      mcp/server.py into the project virtual environment.
+
+      Run this once after cloning, or after upgrading mcp/requirements.txt.
+
+      Example:
+        task mcp:install
+    cmds:
+      - "{{.PYTHON}} -m pip install -r mcp/requirements.txt --quiet"
+      - echo "MCP dependencies installed."
+
+  mcp:setup:
+    desc: "Register the MCP server with Claude Code (.claude/settings.local.json)"
+    summary: |
+      Writes the hashicorp-rag mcpServers entry into .claude/settings.local.json
+      so that Claude Code starts the MCP server automatically when opened in
+      this project directory.
+
+      The corpus ID is auto-detected from Terraform output when CORPUS_ID is
+      not provided. Override with CORPUS_ID=<id> if Terraform state is not
+      available locally.
+
+      After running this task, restart Claude Code. The tools
+      search_hashicorp_docs and get_corpus_info will be available immediately.
+
+      Example:
+        task mcp:setup
+        task mcp:setup CORPUS_ID=6917529027641081856
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    vars:
+      CORPUS_ID:
+        sh: >
+          {{if .CORPUS_ID}}echo "{{.CORPUS_ID}}"{{else}}
+          terraform -chdir={{.TF_DIR}} output -raw corpus_resource_name 2>/dev/null
+          | grep -oE "[0-9]+$" || echo ""{{end}}
+    cmds:
+      - |
+        if [ -z "{{.CORPUS_ID}}" ]; then
+          echo "ERROR: CORPUS_ID could not be determined from Terraform output."
+          echo "       Pass it explicitly: task mcp:setup CORPUS_ID=<id>"
+          exit 1
+        fi
+        scripts/setup_mcp.sh \
+          --project-id {{.PROJECT_ID}} \
+          --region     {{.REGION}} \
+          --corpus-id  {{.CORPUS_ID}}
+
+  mcp:test:
+    desc: "Smoke-test the MCP server tools (Vertex AI corpus + Spanner graph)"
+    summary: |
+      Runs the MCP server's tool functions directly (bypassing the MCP
+      protocol) to confirm that credentials, environment variables, and
+      both backends are working.
+
+      Docs tools (always run):
+        1. get_corpus_info — verifies Vertex configuration
+        2. search_hashicorp_docs — basic query
+        3. search_hashicorp_docs — filtered query (product_family=vault)
+        4. search_hashicorp_docs — no-results edge case
+
+      Graph tools (auto-detected from Terraform output, skipped if absent):
+        5. get_graph_info — Resource/DependsOn counts
+        6. find_resources_by_type — google_storage_bucket
+        7. get_resource_dependencies — both directions, depth 1
+
+      Example:
+        task mcp:test CORPUS_ID=6917529027641081856
+        task mcp:test CORPUS_ID=6917529027641081856 DISTANCE_THRESHOLD=0.5
+    preconditions:
+      - sh: test -n "{{.PROJECT_ID}}"
+        msg: "No active gcloud project. Run 'gcloud config set project <id>' or pass PROJECT_ID=<id>."
+    requires:
+      vars: [CORPUS_ID]
+    vars:
+      SPANNER_INSTANCE:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw spanner_instance_name 2>/dev/null | grep -v null || echo ""'
+      SPANNER_DATABASE:
+        sh: 'terraform -chdir={{.TF_DIR}} output -raw spanner_database_name 2>/dev/null | grep -v null || echo ""'
+    env:
+      VERTEX_PROJECT: "{{.PROJECT_ID}}"
+      VERTEX_REGION: "{{.REGION}}"
+      VERTEX_CORPUS_ID: "{{.CORPUS_ID}}"
+      SPANNER_INSTANCE: "{{.SPANNER_INSTANCE}}"
+      SPANNER_DATABASE: "{{.SPANNER_DATABASE}}"
+    cmds:
+      - "{{.PYTHON}} mcp/test_server.py"
+
+  # ── CI helpers ─────────────────────────────────────────────────────────────
+
+  shellcheck:
+    desc: "Lint all shell scripts under scripts/ and cloudbuild/scripts/"
+    cmds:
+      - |
+        # Use git ls-files when the repo is initialised, otherwise glob the
+        # working tree directly so the task works in a fresh checkout.
+        files=$(git ls-files 'scripts/*.sh' 'cloudbuild/scripts/*.sh' 2>/dev/null)
+        if [ -z "$files" ]; then
+          files=$(ls scripts/*.sh cloudbuild/scripts/*.sh 2>/dev/null)
+        fi
+        if [ -z "$files" ]; then
+          echo "No shell scripts found."
+          exit 0
+        fi
+        # shellcheck SC2086 — intentional word splitting on file list
+        # shellcheck disable=SC2086
+        shellcheck $files
+
+  test:
+    desc: "Run Python unit tests (pytest)"
+    cmds:
+      - |
+        if [ ! -d cloudbuild/scripts/tests ]; then
+          echo "No tests directory yet (cloudbuild/scripts/tests/)."
+          exit 0
+        fi
+        # Prefer the project venv if present; otherwise fall back to the
+        # interpreter on PATH so a fresh clone can run tests immediately.
+        if [ -x "{{.PYTHON}}" ]; then
+          PY="{{.PYTHON}}"
+        else
+          PY="$(command -v python3)"
+        fi
+        "$PY" -m pytest cloudbuild/scripts/tests -v
+
+  ci:
+    desc: "Run all CI checks locally (fmt:check + validate + shellcheck + tests)"
+    cmds:
+      - task: fmt:check
+      - task: validate
+      - task: shellcheck
+      - task: test

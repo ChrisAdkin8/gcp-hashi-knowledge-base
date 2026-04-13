@@ -1,0 +1,133 @@
+timeout: "7200s"
+
+substitutions:
+  _RAG_BUCKET: ""
+  _CHUNK_SIZE: "512"
+  _CHUNK_OVERLAP: "100"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+
+steps:
+  # ── Step 1: Clone all HashiCorp repos ─────────────────────────────────────
+  - id: clone-repos
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        chmod +x cloudbuild/scripts/clone_repos.sh
+        cloudbuild/scripts/clone_repos.sh
+    timeout: "1800s"
+
+  # ── Step 2: Discover modules from Terraform Registry ──────────────────────
+  - id: discover-modules
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r cloudbuild/scripts/requirements.txt --quiet
+        python3 cloudbuild/scripts/discover_modules.py
+    timeout: "300s"
+    waitFor:
+      - clone-repos
+
+  # ── Step 3: Clone discovered modules ─────────────────────────────────────
+  - id: clone-modules
+    name: gcr.io/cloud-builders/git
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        if [ ! -f /workspace/module_repos.txt ]; then
+          echo "WARNING: module_repos.txt not found — skipping module clone step."
+          exit 0
+        fi
+        mkdir -p /workspace/repos/modules
+        while IFS= read -r url; do
+          [ -z "$url" ] && continue
+          name=$(basename "$url" .git)
+          if [ -d "/workspace/repos/modules/$name" ]; then
+            echo "SKIP: $name already cloned"
+            continue
+          fi
+          echo "CLONE: $name <- $url"
+          git clone --depth 1 --single-branch "$url" "/workspace/repos/modules/$name" || \
+            echo "WARNING: Failed to clone $name"
+        done < /workspace/module_repos.txt
+        echo "Module clone step complete."
+    timeout: "1800s"
+    waitFor:
+      - discover-modules
+
+  # ── Step 4: Process docs into cleaned markdown ────────────────────────────
+  - id: process-docs
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r cloudbuild/scripts/requirements.txt --quiet
+        python3 cloudbuild/scripts/process_docs.py
+    timeout: "1800s"
+    waitFor:
+      - clone-repos
+      - clone-modules
+
+  # ── Step 5: Fetch GitHub issues (runs in parallel with clone pipeline) ─────
+  - id: fetch-github-issues
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r cloudbuild/scripts/requirements.txt --quiet
+        python3 cloudbuild/scripts/fetch_github_issues.py
+    timeout: "1800s"
+    waitFor:
+      - "-"
+
+  # ── Step 6: Fetch HashiCorp Discuss threads ──────────────────────────────
+  - id: fetch-discuss
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r cloudbuild/scripts/requirements.txt --quiet
+        python3 cloudbuild/scripts/fetch_discuss.py
+    timeout: "1200s"
+    waitFor:
+      - "-"
+
+  # ── Step 7: Fetch blog posts ─────────────────────────────────────────────
+  - id: fetch-blogs
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - "-c"
+      - |
+        pip install -r cloudbuild/scripts/requirements.txt --quiet
+        python3 cloudbuild/scripts/fetch_blogs.py
+    timeout: "600s"
+    waitFor:
+      - "-"
+
+  # ── Step 8: Upload cleaned docs to GCS ───────────────────────────────────
+  - id: upload-to-gcs
+    name: gcr.io/cloud-builders/gsutil
+    args:
+      - "-m"
+      - "rsync"
+      - "-r"
+      - "-d"
+      - "/workspace/cleaned/"
+      - "gs://${_RAG_BUCKET}/"
+    timeout: "600s"
+    waitFor:
+      - process-docs
+      - fetch-github-issues
+      - fetch-discuss
+      - fetch-blogs

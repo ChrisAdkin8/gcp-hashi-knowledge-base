@@ -1,0 +1,215 @@
+# Cloud Workflows orchestrator for the Terraform graph pipeline.
+#
+# Inputs (passed in the execution `argument`):
+#   graph_repo_uris       - list of HTTPS git URLs of Terraform workspace repos
+#   cloudbuild_repo_uri   - HTTPS URL of THIS repo (cloned by Cloud Build so
+#                           cloudbuild/scripts/ingest_graph.py is available)
+#   graph_staging_bucket  - GCS bucket for raw DOT snapshot uploads
+#   spanner_instance      - Spanner instance name
+#   spanner_database      - Spanner database name
+#   region                - GCP region (Cloud Build location)
+#   service_account       - SA resource ID used as the Cloud Build identity
+#   machine_type          - Cloud Build machine type
+#   build_timeout         - Per-repo build timeout (e.g. "1800s")
+#
+# Behaviour:
+#   1. Validate inputs - if graph_repo_uris is empty, exit cleanly with a
+#      "no repos configured" status (lets the scheduled run be a safe no-op).
+#   2. For each workspace repo in parallel (max 3 concurrent), submit a
+#      Cloud Build that clones the workspace, runs `terraform graph`, and
+#      ingests the DOT into Spanner via ingest_graph.py.
+#   3. Wait for all builds to complete; collect per-repo statuses.
+#   4. Return the per-repo result list. The scheduled run is considered a
+#      success if every build SUCCEEDED.
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - project_id: '${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}'
+          - graph_repo_uris: '${default(map.get(args, "graph_repo_uris"), [])}'
+          - cloudbuild_repo_uri: '${default(map.get(args, "cloudbuild_repo_uri"), "")}'
+          - graph_staging_bucket: '${default(map.get(args, "graph_staging_bucket"), "")}'
+          - spanner_instance: '${default(map.get(args, "spanner_instance"), "")}'
+          - spanner_database: '${default(map.get(args, "spanner_database"), "")}'
+          - region: '${default(map.get(args, "region"), "us-central1")}'
+          - service_account: '${default(map.get(args, "service_account"), "")}'
+          - machine_type: '${default(map.get(args, "machine_type"), "E2_HIGHCPU_8")}'
+          - build_timeout: '${default(map.get(args, "build_timeout"), "1800s")}'
+          - cb_base: "https://cloudbuild.googleapis.com/v1/projects"
+          - results: []
+
+    - check_repos_configured:
+        switch:
+          - condition: '${len(graph_repo_uris) == 0}'
+            next: no_repos_configured
+
+    - ingest_repos:
+        parallel:
+          shared: [results]
+          concurrency_limit: 3
+          for:
+            value: workspace_repo_uri
+            in: ${graph_repo_uris}
+            steps:
+              - submit_one_build:
+                  try:
+                    steps:
+                      - call_build:
+                          call: http.post
+                          args:
+                            url: '${cb_base + "/" + project_id + "/locations/" + region + "/builds"}'
+                            auth:
+                              type: OAuth2
+                            body:
+                              serviceAccount: '${service_account}'
+                              timeout: '${build_timeout}'
+                              options:
+                                logging: "CLOUD_LOGGING_ONLY"
+                                machineType: '${machine_type}'
+                              source:
+                                gitSource:
+                                  url: '${cloudbuild_repo_uri}'
+                                  revision: "refs/heads/main"
+                              substitutions:
+                                _WORKSPACE_REPO_URI: '${workspace_repo_uri}'
+                                _PROJECT_ID: '${project_id}'
+                                _SPANNER_INSTANCE: '${spanner_instance}'
+                                _SPANNER_DATABASE: '${spanner_database}'
+                                _GRAPH_STAGING_BUCKET: '${graph_staging_bucket}'
+                              steps:
+                                - id: install-terraform
+                                  name: gcr.io/cloud-builders/curl
+                                  entrypoint: bash
+                                  args:
+                                    - "-c"
+                                    - |
+                                      set -euo pipefail
+                                      TF_VERSION="1.10.5"
+                                      curl -fsSL "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o /workspace/terraform.zip
+                                      cd /workspace && unzip -q terraform.zip && rm terraform.zip
+                                      ./terraform version
+
+                                - id: clone-workspace
+                                  name: gcr.io/cloud-builders/git
+                                  entrypoint: bash
+                                  args:
+                                    - "-c"
+                                    - |
+                                      set -euo pipefail
+                                      git clone --depth 1 "${_WORKSPACE_REPO_URI}" /workspace/ws_repo
+                                      ls /workspace/ws_repo
+
+                                - id: terraform-graph
+                                  name: python:3.12-slim
+                                  entrypoint: bash
+                                  args:
+                                    - "-c"
+                                    - |
+                                      set -euo pipefail
+                                      apt-get update && apt-get install -y --no-install-recommends git ca-certificates >/dev/null
+                                      # Detect Terraform root: prefer terraform/ subdir, else repo root.
+                                      if ls /workspace/ws_repo/terraform/*.tf 2>/dev/null | head -1 | grep -q .; then
+                                        TF_DIR=/workspace/ws_repo/terraform
+                                      else
+                                        TF_DIR=/workspace/ws_repo
+                                      fi
+                                      echo "Using Terraform root: ${TF_DIR}"
+
+                                      # Strip remote backend blocks so terraform init does not need
+                                      # remote state credentials. Pure regex - no provider deps required.
+                                      python3 - "${TF_DIR}" <<'PY'
+                                      import os, re, sys
+                                      tf_dir = sys.argv[1]
+                                      for fname in sorted(os.listdir(tf_dir)):
+                                          if not fname.endswith('.tf'):
+                                              continue
+                                          path = os.path.join(tf_dir, fname)
+                                          with open(path) as f:
+                                              content = f.read()
+                                          cleaned = re.sub(r'\n?\s*backend\s+"[^"]+"\s*\{[^{}]*\}', '', content)
+                                          if cleaned != content:
+                                              print(f'Stripped backend block from {fname}')
+                                              with open(path, 'w') as f:
+                                                  f.write(cleaned)
+                                      PY
+
+                                      cd "${TF_DIR}"
+                                      /workspace/terraform init -input=false -no-color
+                                      /workspace/terraform graph > /workspace/graph.dot
+                                      echo "DOT graph written ($(wc -l < /workspace/graph.dot) lines)"
+
+                                - id: ingest-graph
+                                  name: python:3.12-slim
+                                  entrypoint: bash
+                                  args:
+                                    - "-c"
+                                    - |
+                                      set -euo pipefail
+                                      pip install --quiet -r cloudbuild/scripts/requirements_graph.txt
+                                      SNAPSHOT_KEY="snapshots/$(basename ${_WORKSPACE_REPO_URI} .git)/$(date -u +%Y%m%dT%H%M%SZ).dot"
+                                      python3 cloudbuild/scripts/ingest_graph.py \
+                                        --dot-path /workspace/graph.dot \
+                                        --repo-uri "${_WORKSPACE_REPO_URI}" \
+                                        --project-id "${_PROJECT_ID}" \
+                                        --instance "${_SPANNER_INSTANCE}" \
+                                        --database "${_SPANNER_DATABASE}" \
+                                        --bucket "${_GRAPH_STAGING_BUCKET}" \
+                                        --snapshot-key "${SNAPSHOT_KEY}"
+                          result: build_res
+                      - record_success:
+                          assign:
+                            - results: '${list.concat(results, [{"workspace_repo_uri": workspace_repo_uri, "build_id": build_res.body.metadata.build.id, "status": "SUCCEEDED"}])}'
+                  except:
+                    as: e
+                    steps:
+                      - record_failure:
+                          assign:
+                            - results: '${list.concat(results, [{"workspace_repo_uri": workspace_repo_uri, "status": "FAILED", "error": e}])}'
+
+    - smoke_query_spanner:
+        # Best-effort sanity check: count nodes via the Spanner REST API.
+        # Auth uses the workflow's own SA, which has roles/spanner.databaseUser.
+        try:
+          steps:
+            - run_count:
+                call: http.post
+                args:
+                  url: '${"https://spanner.googleapis.com/v1/projects/" + project_id + "/instances/" + spanner_instance + "/databases/" + spanner_database + "/sessions"}'
+                  auth:
+                    type: OAuth2
+                  body: {}
+                result: session_res
+            - execute_sql:
+                call: http.post
+                args:
+                  url: '${"https://spanner.googleapis.com/v1/" + session_res.body.name + ":executeSql"}'
+                  auth:
+                    type: OAuth2
+                  body:
+                    sql: "SELECT COUNT(*) AS n FROM Resource"
+                result: count_res
+            - delete_session:
+                call: http.delete
+                args:
+                  url: '${"https://spanner.googleapis.com/v1/" + session_res.body.name}'
+                  auth:
+                    type: OAuth2
+        except:
+          as: e
+          steps:
+            - log_smoke_failure:
+                call: sys.log
+                args:
+                  text: '${"Smoke query failed: " + json.encode_to_string(e)}'
+
+    - return_results:
+        return:
+          status: "completed"
+          results: ${results}
+
+    - no_repos_configured:
+        return:
+          status: "no_repos_configured"
+          message: "graph_repo_uris is empty - nothing to ingest. Set graph_repo_uris in terraform.tfvars and re-apply, or pass it via the workflow execution argument."

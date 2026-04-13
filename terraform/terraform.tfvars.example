@@ -1,0 +1,34 @@
+# Required - replace with your GCP project ID
+project_id = "my-gcp-project-id"
+
+# Required - GitHub HTTPS URL of this repository (used by Cloud Build to clone scripts)
+cloudbuild_repo_uri = "https://github.com/my-org/gcp-hashi-knowledge-base"
+
+# Optional - override defaults
+# region             = "us-central1"
+# refresh_schedule   = "0 2 * * 0"
+# scheduler_timezone = "Europe/London"
+# embedding_model    = "publishers/google/models/text-embedding-005"
+
+# Optional - set to receive email alerts on failures
+# notification_email = "ops-team@example.com"
+
+# ---------------------------------------------------------------------------
+# Optional Terraform dependency-graph pipeline (Spanner Graph backend)
+# ---------------------------------------------------------------------------
+# Set create_graph_store = true and list workspace repos to enable the
+# weekly `terraform graph` -> Spanner ingestion pipeline.
+#
+# create_graph_store = true
+# graph_repo_uris = [
+#   "https://github.com/my-org/my-tf-workspace",
+# ]
+#
+# spanner_instance_name                = "hashicorp-rag-graph"
+# spanner_instance_config              = "regional-us-central1"
+# spanner_processing_units             = 100
+# spanner_database_name                = "tf-graph"
+# spanner_database_deletion_protection = true
+# graph_refresh_schedule               = "0 3 * * 0"
+# graph_cloudbuild_machine_type        = "E2_HIGHCPU_8"
+# graph_build_timeout_seconds          = 1800

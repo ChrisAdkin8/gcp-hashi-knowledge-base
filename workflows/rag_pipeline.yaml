@@ -1,0 +1,273 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - project_id: '${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}'
+          - region: '${default(map.get(args, "region"), "us-west1")}'
+          - corpus_id: '${default(map.get(args, "corpus_id"), "")}'
+          - corpus_display_name: "HashiCorp-Vertex-RAG-Corpus"
+          - bucket_name: '${default(map.get(args, "bucket_name"), "")}'
+          - repo_url: '${default(map.get(args, "repo_url"), "")}'
+          - service_account: '${default(map.get(args, "service_account"), "")}'
+          - build_id: ""
+          - build_status: "WORKING"
+          - poll_interval: 10
+          - cb_base: "https://cloudbuild.googleapis.com/v1/projects"
+          - ai_base: "-aiplatform.googleapis.com/v1beta1/projects"
+
+    # 1. AUTO-PROVISION RAG CORPUS
+    # If corpus_id is passed (e.g. from a manual trigger), use it directly.
+    # Otherwise, list existing corpora and match by display name; create one if none found.
+    - setup_corpus:
+        steps:
+          - check_id_provided:
+              switch:
+                - condition: '${corpus_id != ""}'
+                  next: submit_build
+          - list_corpora:
+              call: http.get
+              args:
+                url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora"}'
+                auth:
+                  type: OAuth2
+              result: list_res
+          - init_search_loop:
+              assign:
+                - corpora_list: '${default(map.get(list_res.body, "ragCorpora"), [])}'
+                - idx: 0
+          - check_loop_condition:
+              switch:
+                - condition: '${idx < len(corpora_list)}'
+                  next: evaluate_corpus
+              next: create_corpus
+          - evaluate_corpus:
+              switch:
+                - condition: '${corpora_list[idx].displayName == corpus_display_name}'
+                  next: found_existing_corpus
+          - increment_index:
+              assign:
+                - idx: '${idx + 1}'
+              next: check_loop_condition
+          - found_existing_corpus:
+              assign:
+                - _name_parts: '${text.split(corpora_list[idx].name, "/")}'
+                - corpus_id: '${_name_parts[len(_name_parts) - 1]}'
+              next: submit_build
+          - create_corpus:
+              call: http.post
+              args:
+                url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora"}'
+                auth:
+                  type: OAuth2
+                body:
+                  displayName: '${corpus_display_name}'
+                  description: "Managed HashiCorp Multi-Product RAG"
+              result: create_res
+          - set_new_id:
+              assign:
+                - _name_parts: '${text.split(create_res.body.name, "/")}'
+                - corpus_id: '${_name_parts[len(_name_parts) - 1]}'
+
+    # 2. CLOUD BUILD
+    - submit_build:
+        try:
+          steps:
+            - call_build:
+                call: http.post
+                args:
+                  url: '${cb_base + "/" + project_id + "/locations/" + region + "/builds"}'
+                  auth:
+                    type: OAuth2
+                  body:
+                    serviceAccount: '${service_account}'
+                    options:
+                      logging: "CLOUD_LOGGING_ONLY"
+                    source:
+                      gitSource:
+                        url: '${repo_url}'
+                        revision: "refs/heads/main"
+                    steps:
+                      - id: clone-repos
+                        name: gcr.io/cloud-builders/git
+                        entrypoint: bash
+                        args: ["-c", "chmod +x cloudbuild/scripts/clone_repos.sh && ./cloudbuild/scripts/clone_repos.sh"]
+                      
+                      - id: setup-venv
+                        name: python:3.12-slim
+                        entrypoint: bash
+                        args: 
+                          - "-c"
+                          - "python3 -m venv /workspace/.venv && /workspace/.venv/bin/pip install requests beautifulsoup4 google-cloud-storage pyyaml"
+                        waitFor: [clone-repos]
+
+                      - id: discover-modules
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/discover_modules.py"]
+                        waitFor: [setup-venv]
+
+                      - id: clone-modules
+                        name: gcr.io/cloud-builders/git
+                        entrypoint: bash
+                        args: ["-c", "mkdir -p /workspace/repos/modules && while read url; do git clone --depth 1 $url /workspace/repos/modules/$(basename $url .git); done < /workspace/module_repos.txt"]
+                        waitFor: [discover-modules]
+
+                      - id: process-docs
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/process_docs.py"]
+                        waitFor: [clone-repos, clone-modules, setup-venv]
+
+                      - id: fetch-github-issues
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/fetch_github_issues.py"]
+                        waitFor: [setup-venv]
+
+                      - id: fetch-discuss
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/fetch_discuss.py"]
+                        waitFor: [setup-venv]
+
+                      - id: fetch-blogs
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/fetch_blogs.py"]
+                        waitFor: [setup-venv]
+
+                      - id: deduplicate
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/deduplicate.py"]
+                        waitFor: [process-docs, fetch-github-issues, fetch-discuss, fetch-blogs]
+
+                      - id: generate-metadata
+                        name: python:3.12-slim
+                        args: ["/workspace/.venv/bin/python3", "cloudbuild/scripts/generate_metadata.py", "--bucket", '${bucket_name}']
+                        waitFor: [deduplicate]
+
+                      - id: upload-to-gcs
+                        name: gcr.io/cloud-builders/gsutil
+                        args: ["-m", "rsync", "-r", "-d", "/workspace/cleaned/", '${"gs://" + bucket_name + "/"}']
+                        waitFor: [generate-metadata]              
+                result: build_res
+            - set_build_id:
+                assign:
+                  - build_id: '${build_res.body.metadata.build.id}'
+        except:
+          as: e
+          steps:
+            - handle_build_error:
+                raise: '${e}'
+
+    # 3. POLL BUILD
+    - poll_build:
+        steps:
+          - check_status:
+              switch:
+                - condition: '${build_status == "SUCCESS"}'
+                  next: import_to_rag
+                - condition: '${build_status == "FAILURE" OR build_status == "CANCELLED" OR build_status == "TIMEOUT"}'
+                  raise: '${"Build Failed: " + build_status}'
+          - wait_interval:
+              call: sys.sleep
+              args:
+                seconds: '${poll_interval}'
+          - apply_backoff:
+              assign:
+                - poll_interval: '${math.min(poll_interval * 1.5, 60)}'
+          - get_status:
+              call: http.get
+              args:
+                url: '${cb_base + "/" + project_id + "/locations/" + region + "/builds/" + build_id}'
+                auth:
+                  type: OAuth2
+              result: poll_res
+          - update_status:
+              assign:
+                - build_status: '${poll_res.body.status}'
+          - loop_poll:
+              next: check_status
+
+    # 4. RAG IMPORT
+    - import_to_rag:
+        call: http.post
+        args:
+          url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora/" + corpus_id + "/ragFiles:import"}'
+          auth:
+            type: OAuth2
+          body:
+            import_rag_files_config:
+              gcs_source:
+                uris: ['${"gs://" + bucket_name + "/"}']
+              rag_file_transformation_config:
+                rag_file_chunking_config:
+                  fixed_length_chunking:
+                    chunk_size: 500
+                    chunk_overlap: 100
+
+    # 5. VALIDATION
+    - validate_retrieval:
+        assign:
+          - retrieve_url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + ":retrieveContexts"}'
+          - corpus_resource: '${"projects/" + project_id + "/locations/" + region + "/ragCorpora/" + corpus_id}'
+          - queries_passed: 0
+    - run_parallel_validation:
+        parallel:
+          shared: [queries_passed]
+          for:
+            value: vq
+            in: 
+              - {topic: "terraform", query: "AWS provider setup"}
+              - {topic: "vault", query: "Transit engine keys"}
+              - {topic: "consul", query: "Service mesh intentions"}
+              - {topic: "nomad", query: "Job spec syntax"}
+              - {topic: "packer", query: "HCL2 build block"}
+              - {topic: "boundary", query: "OIDC auth method"}
+            steps:
+              - run_query:
+                  try:
+                    call: http.post
+                    args:
+                      url: '${retrieve_url}'
+                      auth:
+                        type: OAuth2
+                      body:
+                        vertex_rag_store:
+                          rag_resources:
+                            - rag_corpus: '${corpus_resource}'
+                          vector_distance_threshold: 0.35
+                        query:
+                          text: '${vq.query}'
+                          similarity_top_k: 1
+                    result: r
+                  # FIX: Native Workflows exponential backoff for 503/429 errors
+                  retry:
+                    predicate: ${http.default_retry_predicate}
+                    max_retries: 5
+                    backoff:
+                      initial_delay: 2
+                      max_delay: 32
+                      multiplier: 2
+              - evaluate_result:
+                  switch:
+                    - condition: '${"contexts" in r.body AND "contexts" in r.body.contexts AND len(r.body.contexts.contexts) > 0 AND r.body.contexts.contexts[0].distance < 0.3}'
+                      assign:
+                        - queries_passed: '${queries_passed + 1}'
+
+    # 6. CACHE WARMING
+    - warm_cache:
+        call: http.post
+        args:
+          url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + ":retrieveContexts"}'
+          auth:
+            type: OAuth2
+          body:
+            vertex_rag_store:
+              rag_resources:
+                - rag_corpus: '${"projects/" + project_id + "/locations/" + region + "/ragCorpora/" + corpus_id}'
+            query:
+              text: "HashiCorp product ecosystem overview"
+              similarity_top_k: 5
+
+    - finish_pipeline:
+        call: sys.log
+        args:
+          text: '${"Pipeline Complete. Queries Passed: " + string(queries_passed)}'
+          severity: INFO
