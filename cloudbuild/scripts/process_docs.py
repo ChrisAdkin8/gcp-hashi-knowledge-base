@@ -27,16 +27,9 @@ logger = logging.getLogger(__name__)
 GITHUB_BASE = "https://github.com/hashicorp"
 
 REPO_CONFIG: dict[str, dict[str, str]] = {
-    # Core products
+    # Core products — from legacy standalone repos
     "terraform-website": {"source_type": "documentation", "product": "terraform", "product_family": "terraform", "docs_subdir": "content"},
     "terraform": {"source_type": "documentation", "product": "terraform", "product_family": "terraform", "docs_subdir": "website/docs"},
-    "vault": {"source_type": "documentation", "product": "vault", "product_family": "vault", "docs_subdir": "website/content"},
-    "consul": {"source_type": "documentation", "product": "consul", "product_family": "consul", "docs_subdir": "website/content"},
-    "nomad": {"source_type": "documentation", "product": "nomad", "product_family": "nomad", "docs_subdir": "website/content"},
-    "packer": {"source_type": "documentation", "product": "packer", "product_family": "packer", "docs_subdir": "website/content"},
-    "boundary": {"source_type": "documentation", "product": "boundary", "product_family": "boundary", "docs_subdir": "website/content"},
-    "waypoint": {"source_type": "documentation", "product": "waypoint", "product_family": "waypoint", "docs_subdir": "website/content"},
-    "terraform-docs-agents": {"source_type": "documentation", "product": "terraform", "product_family": "terraform", "docs_subdir": "docs"},
     # Providers
     "terraform-provider-aws": {"source_type": "provider", "product": "aws", "product_family": "terraform", "docs_subdir": "website/docs"},
     "terraform-provider-azurerm": {"source_type": "provider", "product": "azurerm", "product_family": "terraform", "docs_subdir": "website/docs"},
@@ -57,6 +50,24 @@ REPO_CONFIG: dict[str, dict[str, str]] = {
     "policy-library-aws-networking-terraform": {"source_type": "sentinel", "product": "sentinel", "product_family": "terraform", "docs_subdir": ""},
     "policy-library-azurerm-networking-terraform": {"source_type": "sentinel", "product": "sentinel", "product_family": "terraform", "docs_subdir": ""},
     "policy-library-gcp-networking-terraform": {"source_type": "sentinel", "product": "sentinel", "product_family": "terraform", "docs_subdir": ""},
+}
+
+# Products sourced from hashicorp/web-unified-docs (versioned layout).
+# Each key is the subdirectory under content/; value is the product metadata.
+UNIFIED_DOCS_PRODUCTS: dict[str, dict[str, str]] = {
+    "nomad":                  {"source_type": "documentation", "product": "nomad",          "product_family": "nomad"},
+    "vault":                  {"source_type": "documentation", "product": "vault",          "product_family": "vault"},
+    "consul":                 {"source_type": "documentation", "product": "consul",         "product_family": "consul"},
+    "boundary":               {"source_type": "documentation", "product": "boundary",       "product_family": "boundary"},
+    "packer":                 {"source_type": "documentation", "product": "packer",         "product_family": "packer"},
+    "terraform-docs-agents":  {"source_type": "documentation", "product": "terraform",      "product_family": "terraform"},
+    "terraform-docs-common":  {"source_type": "documentation", "product": "hcp-terraform",  "product_family": "terraform"},
+}
+
+# Subpath within the latest version dir that holds the actual content.
+# Most products: <version>/content/; terraform-docs-common: docs/
+UNIFIED_CONTENT_SUBPATHS: dict[str, str] = {
+    "terraform-docs-common": "docs",
 }
 
 DOCS_SEARCH_PATHS = ["docs", "website/docs", "content", "website/content"]
@@ -149,9 +160,13 @@ def _format_compact_header(metadata: dict[str, str]) -> str:
 
 # ENHANCEMENT 1: Helper function to strip layout HTML tags while keeping content.
 def _strip_layout_html(text: str) -> str:
-    """Strips common structural HTML tags that consume tokens without adding semantic value."""
-    text = re.sub(r'', '', text, flags=re.DOTALL) # Remove HTML comments
+    """Strips common structural/JSX tags that consume tokens without adding semantic value."""
+    text = re.sub(r'', '', text, flags=re.DOTALL)  # Remove HTML comments
     text = re.sub(r'</?(div|span|br|hr|a|img|nav|footer)[^>]*>', '', text, flags=re.IGNORECASE)
+    # Strip MDX/JSX components common in web-unified-docs
+    text = re.sub(r'</?(?:Tabs|Tab|Highlight|Note|Warning|Tip|EnterpriseAlert|CodeBlockConfig|CodeTabs|Placement)[^>]*>', '', text, flags=re.IGNORECASE)
+    # Strip import statements (MDX imports)
+    text = re.sub(r'^import\s+.*$', '', text, flags=re.MULTILINE)
     return text
 
 
@@ -347,7 +362,7 @@ def process_directory(
 
     for root, _dirs, files in os.walk(input_dir):
         for filename in files:
-            if not (filename.endswith(".md") or filename.endswith(".mdx")):
+            if not filename.endswith((".md", ".mdx")):
                 continue
 
             src = Path(root) / filename
@@ -421,6 +436,22 @@ def process_directory(
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 
+def _resolve_latest_version(product_dir: Path) -> Path | None:
+    """Return the latest non-RC versioned subdirectory (e.g. v1.11.x)."""
+    candidates = [
+        d for d in product_dir.iterdir()
+        if d.is_dir() and d.name.startswith("v") and "rc" not in d.name.lower()
+    ]
+    if not candidates:
+        return None
+    # Sort by version segments: v1.11.x → (1, 11)
+    def _version_key(p: Path) -> tuple[int, ...]:
+        parts = p.name.lstrip("v").rstrip(".x").split(".")
+        return tuple(int(x) for x in parts if x.isdigit())
+    candidates.sort(key=_version_key)
+    return candidates[-1]
+
+
 def main() -> None:
     repos_root = Path("/workspace/repos")
     cleaned_root = Path("/workspace/cleaned")
@@ -441,6 +472,11 @@ def main() -> None:
             continue
 
         repo_name = repo_dir.name
+
+        # web-unified-docs is handled separately below.
+        if repo_name == "web-unified-docs":
+            continue
+
         config = REPO_CONFIG.get(repo_name)
 
         if config is None:
@@ -479,6 +515,46 @@ def main() -> None:
         )
         counts[source_type] = counts.get(source_type, 0) + n
         logger.info("  %s: %d files processed.", repo_name, n)
+
+    # ── Process web-unified-docs (versioned, multi-product) ──────────────────
+    unified_root = repos_root / "web-unified-docs" / "content"
+    if unified_root.is_dir():
+        for product_slug, meta in UNIFIED_DOCS_PRODUCTS.items():
+            product_content_root = unified_root / product_slug
+            if not product_content_root.is_dir():
+                logger.warning("Unified docs: no directory for %s — skipping.", product_slug)
+                continue
+
+            # Versioned products (nomad, vault, …) vs. unversioned (terraform-docs-common)
+            content_subpath = UNIFIED_CONTENT_SUBPATHS.get(product_slug, "content")
+            latest = _resolve_latest_version(product_content_root)
+            if latest is not None:
+                docs_dir = latest / content_subpath
+            else:
+                docs_dir = product_content_root / content_subpath
+
+            if not docs_dir.is_dir():
+                logger.warning("Unified docs: content dir not found for %s at %s — skipping.", product_slug, docs_dir)
+                continue
+
+            source_type = meta["source_type"]
+            product = meta["product"]
+            product_family = meta["product_family"]
+            output_dir = cleaned_root / source_type / product
+
+            version_label = latest.name if latest else "unversioned"
+            logger.info("Processing unified %s (%s) → %s", product_slug, version_label, output_dir)
+
+            n = process_directory(
+                str(docs_dir), str(output_dir), source_type, product,
+                "web-unified-docs",
+                product_family=product_family,
+                docs_subdir=f"content/{product_slug}/{version_label}/{content_subpath}",
+            )
+            counts[source_type] = counts.get(source_type, 0) + n
+            logger.info("  %s: %d files processed.", product_slug, n)
+    else:
+        logger.warning("web-unified-docs/content not found — skipping unified docs.")
 
     total = sum(counts.values())
     rows = "\n".join(f"  {cat:<20} {cnt:>6}" for cat, cnt in sorted(counts.items()))

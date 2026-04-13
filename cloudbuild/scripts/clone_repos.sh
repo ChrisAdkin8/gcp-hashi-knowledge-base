@@ -16,15 +16,9 @@ mkdir -p "${REPOS_DIR}"
 
 # shellcheck disable=SC2034  # Used via name-reference in run_parallel
 declare -A CORE_REPOS=(
+  ["web-unified-docs"]="https://github.com/hashicorp/web-unified-docs.git"
   ["terraform-website"]="https://github.com/hashicorp/terraform-website.git"
   ["terraform"]="https://github.com/hashicorp/terraform.git"
-  ["vault"]="https://github.com/hashicorp/vault.git"
-  ["consul"]="https://github.com/hashicorp/consul.git"
-  ["nomad"]="https://github.com/hashicorp/nomad.git"
-  ["packer"]="https://github.com/hashicorp/packer.git"
-  ["boundary"]="https://github.com/hashicorp/boundary.git"
-  ["waypoint"]="https://github.com/hashicorp/waypoint.git"
-  ["terraform-docs-agents"]="https://github.com/hashicorp/terraform-docs-agents.git"
 )
 
 # shellcheck disable=SC2034  # Used via name-reference in run_parallel

@@ -64,9 +64,32 @@ main:
                   displayName: '${corpus_display_name}'
                   description: "Managed HashiCorp Multi-Product RAG"
               result: create_res
+          - init_lro:
+              assign:
+                - lro_name: '${create_res.body.name}'
+                - lro_done: false
+          - poll_lro:
+              switch:
+                - condition: '${lro_done}'
+                  next: set_new_id
+          - wait_lro:
+              call: sys.sleep
+              args:
+                seconds: 10
+          - check_lro:
+              call: http.get
+              args:
+                url: '${"https://" + region + "-aiplatform.googleapis.com/v1beta1/" + lro_name}'
+                auth:
+                  type: OAuth2
+              result: lro_res
+          - update_lro:
+              assign:
+                - lro_done: '${default(map.get(lro_res.body, "done"), false)}'
+              next: poll_lro
           - set_new_id:
               assign:
-                - _name_parts: '${text.split(create_res.body.name, "/")}'
+                - _name_parts: '${text.split(lro_res.body.response.name, "/")}'
                 - corpus_id: '${_name_parts[len(_name_parts) - 1]}'
 
     # 2. CLOUD BUILD
