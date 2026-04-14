@@ -39,7 +39,8 @@ os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 # Disable Spanner built-in metrics export to Cloud Monitoring.  The client
 # auto-enables OpenTelemetry metrics in v3.49+, but local runs lack the
 # required resource labels (instance_id), causing noisy 400 errors.
-os.environ.setdefault("GOOGLE_CLOUD_SPANNER_ENABLE_BUILTIN_METRICS", "false")
+# The env var changed in spanner-python ≥3.64: SPANNER_DISABLE_BUILTIN_METRICS=true.
+os.environ.setdefault("SPANNER_DISABLE_BUILTIN_METRICS", "true")
 
 logging.basicConfig(
     level=logging.INFO,

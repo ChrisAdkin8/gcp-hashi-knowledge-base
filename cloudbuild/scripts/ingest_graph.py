@@ -31,7 +31,8 @@ import os
 # Spanner Python client v3.49+ auto-enables OpenTelemetry metrics export, but
 # local / Cloud Build runs lack the required resource labels (instance_id),
 # causing noisy 400 errors against Cloud Monitoring.  Disable built-in metrics.
-os.environ.setdefault("GOOGLE_CLOUD_SPANNER_ENABLE_BUILTIN_METRICS", "false")
+# The env var changed in spanner-python ≥3.64: SPANNER_DISABLE_BUILTIN_METRICS=true.
+os.environ.setdefault("SPANNER_DISABLE_BUILTIN_METRICS", "true")
 import re
 import sys
 from typing import Iterable
