@@ -22,7 +22,7 @@ variable "cloudbuild_repo_uri" {
 variable "graph_repo_uris" {
   type        = list(string)
   description = "GitHub HTTPS URLs of Terraform workspace repositories to plan and ingest into Spanner."
-  default     = []
+  default     = ["https://github.com/ChrisAdkin8/gcp-hashi-knowledge-base.git"]
 }
 
 variable "spanner_instance_name" {

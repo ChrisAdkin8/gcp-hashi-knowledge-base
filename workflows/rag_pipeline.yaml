@@ -6,7 +6,6 @@ main:
           - project_id: '${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}'
           - region: '${default(map.get(args, "region"), "us-west1")}'
           - corpus_id: '${default(map.get(args, "corpus_id"), "")}'
-          - corpus_display_name: "HashiCorp-Vertex-RAG-Corpus"
           - bucket_name: '${default(map.get(args, "bucket_name"), "")}'
           - repo_url: '${default(map.get(args, "repo_url"), "")}'
           - service_account: '${default(map.get(args, "service_account"), "")}'
@@ -16,81 +15,16 @@ main:
           - cb_base: "https://cloudbuild.googleapis.com/v1/projects"
           - ai_base: "-aiplatform.googleapis.com/v1beta1/projects"
 
-    # 1. AUTO-PROVISION RAG CORPUS
-    # If corpus_id is passed (e.g. from a manual trigger), use it directly.
-    # Otherwise, list existing corpora and match by display name; create one if none found.
-    - setup_corpus:
-        steps:
-          - check_id_provided:
-              switch:
-                - condition: '${corpus_id != ""}'
-                  next: submit_build
-          - list_corpora:
-              call: http.get
-              args:
-                url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora"}'
-                auth:
-                  type: OAuth2
-              result: list_res
-          - init_search_loop:
-              assign:
-                - corpora_list: '${default(map.get(list_res.body, "ragCorpora"), [])}'
-                - idx: 0
-          - check_loop_condition:
-              switch:
-                - condition: '${idx < len(corpora_list)}'
-                  next: evaluate_corpus
-              next: create_corpus
-          - evaluate_corpus:
-              switch:
-                - condition: '${corpora_list[idx].displayName == corpus_display_name}'
-                  next: found_existing_corpus
-          - increment_index:
-              assign:
-                - idx: '${idx + 1}'
-              next: check_loop_condition
-          - found_existing_corpus:
-              assign:
-                - _name_parts: '${text.split(corpora_list[idx].name, "/")}'
-                - corpus_id: '${_name_parts[len(_name_parts) - 1]}'
-              next: submit_build
-          - create_corpus:
-              call: http.post
-              args:
-                url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora"}'
-                auth:
-                  type: OAuth2
-                body:
-                  displayName: '${corpus_display_name}'
-                  description: "Managed HashiCorp Multi-Product RAG"
-              result: create_res
-          - init_lro:
-              assign:
-                - lro_name: '${create_res.body.name}'
-                - lro_done: false
-          - poll_lro:
-              switch:
-                - condition: '${lro_done}'
-                  next: set_new_id
-          - wait_lro:
-              call: sys.sleep
-              args:
-                seconds: 10
-          - check_lro:
-              call: http.get
-              args:
-                url: '${"https://" + region + "-aiplatform.googleapis.com/v1beta1/" + lro_name}'
-                auth:
-                  type: OAuth2
-              result: lro_res
-          - update_lro:
-              assign:
-                - lro_done: '${default(map.get(lro_res.body, "done"), false)}'
-              next: poll_lro
-          - set_new_id:
-              assign:
-                - _name_parts: '${text.split(lro_res.body.response.name, "/")}'
-                - corpus_id: '${_name_parts[len(_name_parts) - 1]}'
+    # 1. VALIDATE CORPUS ID
+    # The corpus is created once by scripts/create_corpus.py and its ID is
+    # passed via the scheduler (or manual trigger).  Fail fast if missing.
+    - validate_corpus_id:
+        switch:
+          - condition: '${corpus_id != ""}'
+            next: submit_build
+        next: fail_missing_corpus_id
+    - fail_missing_corpus_id:
+        raise: "corpus_id is required. Run scripts/create_corpus.py and pass the ID via corpus.auto.tfvars or --data."
 
     # 2. CLOUD BUILD
     - submit_build:
@@ -185,7 +119,7 @@ main:
           - check_status:
               switch:
                 - condition: '${build_status == "SUCCESS"}'
-                  next: import_to_rag
+                  next: init_import
                 - condition: '${build_status == "FAILURE" OR build_status == "CANCELLED" OR build_status == "TIMEOUT"}'
                   raise: '${"Build Failed: " + build_status}'
           - wait_interval:
@@ -208,22 +142,62 @@ main:
           - loop_poll:
               next: check_status
 
-    # 4. RAG IMPORT
-    - import_to_rag:
-        call: http.post
+    # 4. RAG IMPORT — batched by content prefix (API limit: 10 000 files per call)
+    - init_import:
+        assign:
+          - import_base_url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora/" + corpus_id + "/ragFiles:import"}'
+          - import_batches_done: 0
+    - import_batches:
+        for:
+          value: prefix
+          in:
+            - "blog/"
+            - "documentation/boundary/"
+            - "documentation/consul/"
+            - "documentation/hcp-terraform/"
+            - "documentation/nomad/"
+            - "documentation/packer/"
+            - "documentation/terraform/"
+            - "documentation/vault/"
+            - "issues/"
+            - "provider/"
+            - "sentinel/"
+          steps:
+            - start_batch_import:
+                call: http.post
+                args:
+                  url: '${import_base_url}'
+                  auth:
+                    type: OAuth2
+                  body:
+                    importRagFilesConfig:
+                      gcsSource:
+                        uris: ['${"gs://" + bucket_name + "/" + prefix}']
+                      ragFileTransformationConfig:
+                        ragFileChunkingConfig:
+                          fixedLengthChunking:
+                            chunkSize: 1024
+                            chunkOverlap: 20
+                result: import_op
+            - await_batch:
+                call: await_import_op
+                args:
+                  region: '${region}'
+                  op_name: '${import_op.body.name}'
+                result: final_op
+            - log_batch:
+                call: sys.log
+                args:
+                  text: '${"Import batch done: " + prefix}'
+                  severity: INFO
+            - count_batch:
+                assign:
+                  - import_batches_done: '${import_batches_done + 1}'
+    - log_import_summary:
+        call: sys.log
         args:
-          url: '${"https://" + region + ai_base + "/" + project_id + "/locations/" + region + "/ragCorpora/" + corpus_id + "/ragFiles:import"}'
-          auth:
-            type: OAuth2
-          body:
-            import_rag_files_config:
-              gcs_source:
-                uris: ['${"gs://" + bucket_name + "/"}']
-              rag_file_transformation_config:
-                rag_file_chunking_config:
-                  fixed_length_chunking:
-                    chunk_size: 500
-                    chunk_overlap: 100
+          text: '${"All " + string(import_batches_done) + " import batches completed"}'
+          severity: INFO
 
     # 5. VALIDATION
     - validate_retrieval:
@@ -294,3 +268,45 @@ main:
         args:
           text: '${"Pipeline Complete. Queries Passed: " + string(queries_passed)}'
           severity: INFO
+
+# ── Subworkflow: poll a Vertex AI LRO until done ──────────────────────────────
+await_import_op:
+  params: [region, op_name]
+  steps:
+    - init_poll:
+        assign:
+          - poll_interval: 15
+          - poll_count: 0
+          - max_polls: 80
+          - op_url: '${"https://" + region + "-aiplatform.googleapis.com/v1beta1/" + op_name}'
+    - poll_loop:
+        steps:
+          - get_op:
+              call: http.get
+              args:
+                url: '${op_url}'
+                auth:
+                  type: OAuth2
+              result: op_resp
+          - check_done:
+              switch:
+                - condition: '${default(map.get(op_resp.body, "done"), false) == true}'
+                  next: check_error
+                - condition: '${poll_count >= max_polls}'
+                  raise: '${"Import LRO timed out after " + string(poll_count) + " polls: " + op_name}'
+          - wait:
+              call: sys.sleep
+              args:
+                seconds: '${poll_interval}'
+          - increment:
+              assign:
+                - poll_count: '${poll_count + 1}'
+                - poll_interval: '${math.min(poll_interval * 1.5, 60)}'
+          - loop:
+              next: get_op
+    - check_error:
+        switch:
+          - condition: '${"error" in op_resp.body}'
+            raise: '${"Import failed (" + op_name + "): code=" + string(op_resp.body.error.code) + " " + op_resp.body.error.message}'
+    - return_result:
+        return: '${op_resp.body}'

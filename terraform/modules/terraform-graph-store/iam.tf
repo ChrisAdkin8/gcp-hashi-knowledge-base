@@ -5,23 +5,14 @@ resource "google_service_account" "graph_pipeline" {
   description  = "Service account used by the Terraform dependency-graph ingestion pipeline."
 }
 
-# Project-level roles that have no resource-level equivalent.
+# Project-level roles.  spanner.databaseUser is here (not database-scoped)
+# because the doormat org policy blocks spanner.databases.setIamPolicy.
 resource "google_project_iam_member" "graph_pipeline_project_roles" {
   for_each = local.service_account_project_roles
 
   project = var.project_id
   role    = each.value
   member  = "serviceAccount:${google_service_account.graph_pipeline.email}"
-}
-
-# Database-scoped Spanner access (replaces the project-level
-# roles/spanner.databaseUser).
-resource "google_spanner_database_iam_member" "graph_pipeline_database_user" {
-  project  = var.project_id
-  instance = google_spanner_instance.graph.name
-  database = google_spanner_database.graph.name
-  role     = "roles/spanner.databaseUser"
-  member   = "serviceAccount:${google_service_account.graph_pipeline.email}"
 }
 
 # Bucket-scoped storage admin (replaces the project-level

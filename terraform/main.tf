@@ -19,6 +19,7 @@ module "hashicorp_docs_pipeline" {
   project_id           = var.project_id
   region               = var.region
   environment          = var.environment
+  corpus_id            = var.corpus_id
   cloudbuild_repo_uri  = var.cloudbuild_repo_uri
   refresh_schedule     = var.refresh_schedule
   scheduler_timezone   = var.scheduler_timezone

@@ -62,7 +62,7 @@ Acts as the staging area between Cloud Build and Vertex AI RAG Engine. Processed
 
 Manages the vector corpus. It handles chunking, embedding, and vector storage internally. The managed infrastructure includes a Spanner instance (billed continuously) and embedding infrastructure. The embedding model is configurable; the default (`text-embedding-005`) provides strong semantic performance for technical documentation.
 
-The RAG corpus is **not** a Terraform-managed resource — `google_vertex_ai_rag_corpus` does not exist in the Google provider 6.x. Instead, the corpus is provisioned automatically by the Cloud Workflow on its first run: the `setup_corpus` step lists existing corpora, matches by display name (`HashiCorp-Vertex-RAG-Corpus`), and creates one if none is found. This makes the corpus lifecycle fully self-healing — if it is deleted, the next pipeline run recreates it automatically.
+The RAG corpus is **not** a Terraform-managed resource — `google_vertex_ai_rag_corpus` does not exist in the Google provider 6.x. Instead, the corpus is created once by `scripts/create_corpus.py` (which lists existing corpora first and only creates if no match is found). The corpus ID is persisted in `terraform/corpus.auto.tfvars` and passed through Terraform to the Cloud Scheduler, which includes it in every workflow invocation. The workflow validates that `corpus_id` is present and fails fast if it is missing — it never creates a corpus itself.
 
 ---
 
@@ -112,12 +112,13 @@ The API fetch scripts run in parallel with the git clone pipeline. All output is
 
 ## Chunking Strategy
 
-Documents are semantically pre-split before upload. Vertex AI RAG Engine applies `fixed_length_chunking` at 500 tokens with 100-token overlap during import. The pre-splitting ensures that chunk boundaries align with document structure rather than falling mid-sentence or mid-code-block.
+Documents are semantically pre-split before upload. Vertex AI RAG Engine applies `fixed_length_chunking` at 1024 tokens with 20-token overlap during import. The larger chunk size matches the pre-split section sizes more closely, reducing unnecessary mid-section splits. The minimal overlap avoids redundant token waste across chunk boundaries.
 
 **Pre-splitting logic (`process_docs.py` — docs, providers, modules, sentinel):**
 - Documents are split at `##` and `###` Markdown heading boundaries
 - Sections < 200 characters are merged into the preceding section
-- Sections > 4,000 characters are further split at code-fence boundaries
+- Sections > 2,000 characters are further split at code-fence boundaries to stay within the 1024-token chunk window
+- Code blocks are compressed (comments stripped, blank lines collapsed) before splitting
 - Each output file carries a `section_title` metadata field
 
 **Pre-splitting logic (`fetch_blogs.py` — blog posts):**
@@ -127,7 +128,7 @@ Documents are semantically pre-split before upload. Vertex AI RAG Engine applies
 
 This ensures that content units like "Argument Reference", "Example Usage", and "Import" each become natural chunk boundaries, aligned with how technical documentation is structured.
 
-To adjust chunk boundaries, modify the `MIN_SECTION_SIZE` constant and `_split_large_section` threshold in `cloudbuild/scripts/process_docs.py`. To adjust the RAG Engine chunk size, edit `chunk_size` in `workflows/rag_pipeline.yaml`.
+To adjust chunk boundaries, modify the `MIN_SECTION_SIZE` constant and `_split_large_section` threshold in `cloudbuild/scripts/process_docs.py`. To adjust the RAG Engine chunk size, edit `chunkSize` in `workflows/rag_pipeline.yaml` (currently 1024 tokens, 20-token overlap).
 
 ---
 
@@ -145,7 +146,7 @@ Each document body begins with a compact single-line attribution prefix written 
 [blog:terraform] Running Terraform in CI — Setting Up Remote State
 ```
 
-The full metadata (`product`, `product_family`, `source_type`, `file_name`) is stored separately in `metadata.jsonl` by `generate_metadata.py` and registered with the RAG Engine at import time. The in-body prefix exists solely to orient the LLM about the source of a retrieved chunk.
+The full metadata (`product`, `product_family`, `source_type`, `file_name`) is stored separately in `metadata.jsonl` by `generate_metadata.py` and registered with the RAG Engine at import time. The in-body prefix exists solely to orient the LLM about the source of a retrieved chunk. At retrieval time, the MCP server strips these prefixes from returned chunks (the source URI already conveys this information), further reducing per-result token overhead.
 
 ### Source-specific notes
 
@@ -163,7 +164,7 @@ The graph pipeline is opt-in (`create_graph_store = true`) and lives in `terrafo
 
 | Component | Purpose |
 |---|---|
-| **Spanner instance** (`hashicorp-rag-graph` by default) | Hosts the property graph database. Regional `regional-us-central1` config, 100 PU minimum (~$65/mo). |
+| **Spanner instance** (`hashicorp-rag-graph` by default) | Hosts the property graph database. Regional `regional-us-central1` config, 100 PU minimum (~$65/mo). Must use `edition = "ENTERPRISE"` — the GRAPH feature is not available in STANDARD edition. |
 | **Spanner database** (`tf-graph`) | Holds two tables and one property graph: `Resource` (nodes), `DependsOn` (edges, interleaved in `Resource` with `ON DELETE CASCADE`), and `tf_graph` — a `CREATE PROPERTY GRAPH` over both, queryable via GoogleSQL graph syntax. |
 | **GCS staging bucket** (`<project>-graph-staging-<hash>`) | Stores raw DOT snapshots from each `terraform graph` run for offline debugging. 30-day lifecycle delete. |
 | **Cloud Workflows** (`workflows/graph_pipeline.yaml`) | Fans out per-repo Cloud Build executions in parallel (concurrency 3) and reports per-repo status. |

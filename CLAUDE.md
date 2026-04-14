@@ -25,7 +25,9 @@ task fmt:check         # check Terraform formatting (no writes)
 
 - **Vertex AI RAG corpus**: do not create the corpus in Terraform - the
   `google_vertex_ai_rag_corpus` resource does not exist in google provider 6.x.
-  The workflow `setup_corpus` step auto-provisions and self-heals it.
+  The corpus is created once by `scripts/create_corpus.py` (get-or-create) and
+  its ID is persisted in `terraform/corpus.auto.tfvars`. The workflow requires
+  `corpus_id` as an argument and will fail fast if it is missing.
 - **Cloud Build substitutions**: must be underscore-prefixed (`_BUCKET_NAME`).
   Unprefixed names are reserved and rejected by the API.
 - **Cloud Workflows**: subworkflow args must be JSON-serialisable. Passing a
@@ -38,8 +40,20 @@ task fmt:check         # check Terraform formatting (no writes)
 - **Spanner Graph DDL**: `CREATE PROPERTY GRAPH` must reference tables that
   already exist in the same DDL batch - split into two `update_ddl` calls and
   it fails with `Table not found`.
+- **Spanner Graph edition**: the Spanner instance must set `edition = "ENTERPRISE"`.
+  The GRAPH feature is not available in the STANDARD edition — the apply fails
+  with `Feature GRAPH is not available … minimum required Edition is ENTERPRISE`.
 - **Spanner auth**: use the google-cloud-spanner client with ADC. Do not write
   manual signing code.
+- **Spanner database-level IAM**: the doormat org policy blocks
+  `spanner.databases.setIamPolicy`, so `roles/spanner.databaseUser` must be
+  granted at **project level** (via `google_project_iam_member`), not at
+  database level (via `google_spanner_database_iam_member`).
+- **Cloud Workflows map literals**: map literals `{"key": value}` are **not**
+  valid inside Workflows expression syntax (`${...}`). Use a named `assign` step
+  to build the map as a YAML object, then reference the variable name in the
+  `list.concat` call. Inline `{...}` produces parse errors (`extraneous input '{'`,
+  `token recognition error at ':'`).
 
 ## Architecture (Key Facts)
 
@@ -64,4 +78,5 @@ task fmt:check         # check Terraform formatting (no writes)
 - Don't use unprefixed Cloud Build substitution variable names
 - Don't pass raw maps to `http.post` body in Cloud Workflows - JSON-encode first
 - Don't hand-roll Spanner auth - use the official client with ADC
+- Don't use `google_spanner_database_iam_member` - the org policy blocks it; use project-level IAM instead
 - Don't add `.terraform/`, `__pycache__`, `*.tfstate`, `node_modules`, `.git/`, or logs to version control

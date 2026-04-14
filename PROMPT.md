@@ -50,11 +50,13 @@ Documents are processed through a two-stage chunking pipeline:
 
 1. **Semantic pre-splitting** (`process_docs.py`): Documents are split at `##` and `###` heading boundaries before upload. Each section becomes a self-contained file with its own metadata header. Sections smaller than 200 characters are merged with the previous section. Multi-section documents are written as `{stem}_s0.md`, `{stem}_s1.md`, etc.
 
-2. **Fixed-length chunking** (Vertex AI RAG Engine): The RAG Engine's built-in chunker (1024 tokens, 200 token overlap) operates on the pre-split sections. Because each input file is already a coherent content unit, the chunker rarely splits within a section.
+2. **Fixed-length chunking** (Vertex AI RAG Engine): The RAG Engine's built-in chunker (1024 tokens, 20-token overlap) operates on the pre-split sections. The larger chunk size closely matches the pre-split section sizes, so the chunker rarely introduces additional splits. The minimal overlap reduces redundant token waste across boundaries.
 
-3. **Code block integrity** (`process_docs.py`): After semantic splitting, sections exceeding ~4000 characters (approximately 1024 tokens) are further split at code block boundaries rather than at arbitrary positions. This ensures fenced code blocks (HCL configurations, CLI examples) are never split mid-block by the downstream fixed-length chunker. Sections without code fences or below the threshold are left intact.
+3. **Code block compression** (`process_docs.py`): Before splitting, fenced code blocks are compressed — single-line comments are stripped and runs of blank lines are collapsed. This reduces per-chunk token count without losing semantic value.
 
-This approach ensures that chunks align with document structure (headings, code blocks, argument tables) rather than arbitrary token boundaries. The 1024-token size was chosen because HashiCorp documentation is heavy on HCL code blocks and argument reference tables that commonly exceed 512 tokens.
+4. **Code block integrity** (`process_docs.py`): After semantic splitting, sections exceeding ~2000 characters (approximately 500 tokens) are further split at code block boundaries rather than at arbitrary positions. This ensures fenced code blocks (HCL configurations, CLI examples) are never split mid-block by the downstream fixed-length chunker. Sections without code fences or below the threshold are left intact.
+
+This approach ensures that chunks align with document structure (headings, code blocks, argument tables) rather than arbitrary token boundaries. The 1024-token size closely matches the pre-split section sizes so that the fixed-length chunker rarely introduces additional splits.
 
 ### Cross-Source Deduplication
 
@@ -116,7 +118,7 @@ This prevents the same content from entering the corpus through multiple sources
 └── scripts/
     ├── deploy.sh                       # End-to-end deploy orchestrator (called by task up)
     ├── bootstrap_state.sh              # Create GCS state bucket (one-time)
-    ├── create_corpus.py                # Create Vertex AI RAG corpus manually (optional — workflow auto-provisions)
+    ├── create_corpus.py                # Get-or-create Vertex AI RAG corpus; writes ID to corpus.auto.tfvars
     ├── run_pipeline.sh                 # Trigger workflow via REST API
     ├── setup_claude_vertex.sh          # Configure Claude Code for Vertex AI backend
     ├── setup_mcp.sh                    # Register MCP server with Claude Code settings
@@ -164,7 +166,7 @@ terraform {
 | `embedding_model` | string | `"publishers/google/models/text-embedding-005"` | Vertex AI embedding model |
 | `notification_email` | string | `""` | Email for monitoring alerts |
 
-**Removed variables:** `corpus_display_name`, `corpus_id`, `chunk_size`, and `chunk_overlap` are no longer Terraform variables. The corpus is auto-provisioned by the workflow on first run; chunk size (500 tokens, 100 overlap) is hardcoded in the workflow definition.
+**`corpus_id`** is a required Terraform variable — created by `scripts/create_corpus.py` and stored in `terraform/corpus.auto.tfvars`. It is passed through to the Cloud Scheduler, which includes it in every workflow invocation. `corpus_display_name`, `chunk_size`, and `chunk_overlap` are not Terraform variables; chunk size (1024 tokens, 20 overlap) is hardcoded in the workflow definition.
 
 **Important:** `rag_bucket_name` is **not** a variable. It is computed in `locals`:
 ```hcl
@@ -248,15 +250,15 @@ resource "google_document_ai_processor" "layout_parser" {
 
 Six steps plus a logging finish step:
 
-1. **init** — Resolve runtime parameters from `args` using `map.get(args, "key")`. All keys are flat (no nesting). Sets `corpus_id = ""` and `corpus_display_name = "HashiCorp-Vertex-RAG-Corpus"` as defaults.
+1. **init** — Resolve runtime parameters from `args` using `map.get(args, "key")`. All keys are flat (no nesting). `corpus_id` defaults to `""` but must be provided by the caller (scheduler or manual trigger).
 
-2. **setup_corpus** — Auto-provisions the Vertex AI RAG corpus. If `corpus_id` is passed in `args`, it is used directly (short-circuits to `submit_build`). Otherwise: list existing corpora via `GET /ragCorpora`, scan for a match on `displayName`, reuse the existing corpus if found, or create a new one with `POST /ragCorpora`. The numeric ID is extracted from the returned resource name by splitting on `/`. This step means **no manual corpus creation is required** — the workflow is self-bootstrapping on first run.
+2. **validate_corpus_id** — Checks that `corpus_id` is non-empty. If missing, raises an error: `"corpus_id is required. Run scripts/create_corpus.py and pass the ID via corpus.auto.tfvars or --data."` The corpus is created once by `scripts/create_corpus.py` and its ID is baked into the scheduler via Terraform.
 
 3. **submit_build** — POST to `https://cloudbuild.googleapis.com/v1/projects/{project}/locations/{region}/builds` with OAuth2 auth. The build spec is embedded inline. **No `substitutions:` block** — variables are resolved by Workflow expressions before submission. Extracts `build_id` from `build_response.body.metadata.build.id`.
 
 4. **poll_build** — Adaptive backoff loop. GET build status; sleep starts at 10s and grows by ×1.5 up to a 60s cap. Exits on `SUCCESS`, raises on `FAILURE`, `CANCELLED`, or `TIMEOUT`.
 
-5. **import_to_rag** — POST to Vertex AI RAG `ragFiles:import` endpoint. Passes GCS URI and chunking config nested under `rag_file_transformation_config.rag_file_chunking_config.fixed_length_chunking` (500 tokens, 100 overlap). Documents are pre-split by `process_docs.py`, so the fixed-length chunker operates on coherent content units.
+5. **import_to_rag** — POST to Vertex AI RAG `ragFiles:import` endpoint. Passes GCS URI and chunking config nested under `rag_file_transformation_config.rag_file_chunking_config.fixed_length_chunking` (1024 tokens, 20 overlap). The larger chunk size closely matches the pre-split section sizes. Documents are pre-split by `process_docs.py`, so the fixed-length chunker rarely introduces additional splits.
 
 6. **validate_retrieval** — Runs 6 retrieval queries in **parallel** (using the Workflows `parallel` keyword with a shared `queries_passed` counter) covering terraform, vault, consul, nomad, packer, and boundary. Each query POSTs to `retrieveContexts` with `vector_distance_threshold: 0.35` and `similarity_top_k: 1`. A query is counted as passing when `distance < 0.3`. Uses `http.default_retry_predicate` with exponential backoff (initial 2s, max 32s, ×2, max 5 retries) to handle transient 503/429 errors from the retrieval API. Zero results for a topic does NOT fail the pipeline.
 
@@ -294,14 +296,14 @@ All Python steps use the venv at `/workspace/.venv/bin/python3`. Options: `loggi
 
 End-to-end deploy orchestrator. Called by `task up`. Steps:
 1. Bootstrap GCS state bucket (`scripts/bootstrap_state.sh`)
-2. `terraform init` + `terraform apply` — provisions all infrastructure (service account, IAM, GCS bucket, workflow, scheduler, Document AI processor)
-3. Wait 90 s for IAM propagation, then trigger first pipeline run (`scripts/run_pipeline.sh --wait`) — the workflow's `setup_corpus` step auto-provisions the RAG corpus on this run
+2. Create (or find) the RAG corpus via `scripts/create_corpus.py --output-id-only` — writes the ID to `terraform/corpus.auto.tfvars`
+3. `terraform init` + `terraform apply` — provisions all infrastructure. The scheduler includes `corpus_id` in every workflow invocation.
+4. Wait 90 s for IAM propagation, then trigger first pipeline run (`scripts/run_pipeline.sh --wait`) with the corpus ID.
 
-There is **no separate corpus creation step** and **no `corpus.auto.tfvars`** file. The corpus is managed entirely by the workflow.
-
-**Workflow data:** Passed as flat JSON dict (no "args" wrapper, no corpus_id/chunk params):
+**Workflow data:** Passed as flat JSON dict including `corpus_id`:
 ```bash
 WORKFLOW_DATA=$(python3 -c "import json; print(json.dumps({
+  'corpus_id':       '${CORPUS_ID}',
   'bucket_name':     '${RAG_BUCKET}',
   'region':          '${REGION}',
   'repo_url':        '${REPO_URI}',
@@ -321,7 +323,7 @@ REQUEST_BODY="{\"argument\": ${ARGUMENT}}"
 
 ### scripts/create_corpus.py
 
-**Optional — the workflow auto-provisions the corpus on first run.** This script is retained for manual corpus creation or recovery scenarios.
+**Required for deployment.** This script is called by `deploy.sh` to get-or-create the corpus. It lists existing corpora, returns a match by display name, or creates a new one if none is found. The `--output-id-only` flag prints just the numeric ID to stdout (all logging goes to stderr) for machine-readable capture.
 
 Creates a Vertex AI RAG corpus using the `vertexai` SDK. Requires `google-cloud-aiplatform >= 1.143`.
 
@@ -394,7 +396,7 @@ Registers the HashiCorp RAG MCP server with Claude Code by writing the `mcpServe
 
 ### scripts/test_token_efficiency.py
 
-Measures token efficiency of RAG retrieval versus pasting raw documentation into context. Runs cross-product queries (e.g., "Vault + Terraform provider", "Consul + Nomad scheduling") and compares tokens retrieved from the corpus (`top_k=5`, 1024-token chunks) against estimated tokens for equivalent full documentation pages. Outputs a per-query breakdown and a summary showing average token savings.
+Measures token efficiency of RAG retrieval versus pasting raw documentation into context. Runs cross-product queries (e.g., "Vault + Terraform provider", "Consul + Nomad scheduling") and compares tokens retrieved from the corpus (`top_k=3`, 1024-token chunks) against estimated tokens for equivalent full documentation pages. Outputs a per-query breakdown and a summary showing average token savings.
 
 ### cloudbuild/scripts/generate_metadata.py
 
@@ -437,7 +439,9 @@ Processes cloned repo documentation into cleaned markdown files. Key features:
 
 **Semantic section splitting (stage 1 of the two-stage chunking pipeline):** Documents are split at `##` and `###` heading boundaries. Each section becomes a self-contained file with its own metadata header. Sections smaller than 200 characters are merged with the previous section to avoid tiny fragments. Single-section documents preserve their original path structure; multi-section documents are written as `{stem}_s{N}.md`. This pre-splitting ensures that the Vertex AI fixed-length chunker (stage 2, 1024 tokens) operates on already-coherent content units — keeping HCL code blocks, argument tables, and multi-step examples intact within a single chunk.
 
-**Code block integrity:** Oversized sections (>4000 chars) are split between fenced code blocks (` ``` `) rather than at arbitrary positions. Each sub-section retains the original heading for context. This prevents partial HCL configurations from appearing in chunks.
+**Code block compression:** Before splitting, `_compress_code_blocks()` strips single-line comments and collapses blank lines inside fenced code blocks. This reduces per-chunk token count for the HCL/JSON/YAML examples common in HashiCorp docs.
+
+**Code block integrity:** Oversized sections (>2000 chars) are split between fenced code blocks (` ``` `) rather than at arbitrary positions. Each sub-section retains the original heading for context. This prevents partial HCL configurations from appearing in chunks.
 
 **Enriched metadata header:** Each output file includes:
 - `source_type` — documentation, provider, module, or sentinel
@@ -483,9 +487,9 @@ Fetches blog posts from the HashiCorp blog (Atom feed + archive pages) and Mediu
 |---|---|
 | GCP project | `hc-e96dc2a274054e128e6309abba6` |
 | Region | `us-west1` |
-| Corpus display name | `HashiCorp-Vertex-RAG-Corpus` (auto-provisioned by workflow) |
-| Chunk size | 500 tokens |
-| Chunk overlap | 100 tokens |
+| Corpus display name | `hashicorp-knowledge-base` (created by `scripts/create_corpus.py`) |
+| Chunk size | 1024 tokens |
+| Chunk overlap | 20 tokens |
 | RAG bucket | `hc-e96dc2a274054e128e6309abba6-rag-docs-878aa953` |
 | State bucket | `hc-e96dc2a274054e128e6309abba6-tf-state-878aa953` |
 | Workflow name | `rag-hashicorp-pipeline` |
@@ -520,8 +524,8 @@ Runs on push and PR. Uses Workload Identity Federation (WIF) — no service acco
 | `fetch-github-issues` timeout | Unauthenticated GitHub API waits 1hr on rate limit; exceeds 1800s step timeout | Script fails fast on rate limit; only 8 priority repos fetched without token |
 | RAG import chunking API path | `rag_file_chunking_config` was moved; it's no longer a direct child of `import_rag_files_config` | Nest under `rag_file_transformation_config.rag_file_chunking_config.fixed_length_chunking` |
 | Document AI processor location | `LAYOUT_PARSER_PROCESSOR` is only available in the `us` multi-region | Set `location = "us"` in `google_document_ai_processor`; do not use the deployment region |
-| Corpus auto-provisioning race | First pipeline run must wait for IAM propagation or it gets a 403 on corpus creation | `deploy.sh` sleeps 90 s after `terraform apply` before triggering the pipeline |
-| Chunk size change | Chunk size is now 500 tokens (was 1024) with 100 token overlap (was 200) | Hardcoded in the workflow; no Terraform variable to override |
+| Corpus race condition (fixed) | Concurrent workflow executions each created a new corpus when none existed | Corpus is now created once by `scripts/create_corpus.py` (get-or-create) and its ID is passed explicitly to every workflow execution |
+| Chunk size change | Chunk size is now 1024 tokens with 20 token overlap | Hardcoded in the workflow; no Terraform variable to override |
 
 ---
 
@@ -550,6 +554,11 @@ scripts/setup_mcp.sh --project-id <id> --corpus-id <id>      # write .claude/set
 
 **Path-based metadata inference:** The server infers `product`, `product_family`, and `source_type` from the GCS object path returned in retrieval results. Filters passed to `search_hashicorp_docs` are applied client-side after retrieval.
 
+**Token efficiency features:**
+- **Semantic reranking** — retrieval uses `semantic-ranker-512@latest` to re-score results, improving relevance so a lower `top_k` delivers the same quality
+- **Per-document deduplication** — only the highest-scoring chunk per source URI is returned, eliminating redundant context from the same file
+- **Compact output format** — results use a single-line header (`[N] path (score)`) with the `gs://bucket/` prefix stripped, reducing framing overhead
+
 ---
 
 ## Diagrams
@@ -558,7 +567,7 @@ Two hand-crafted SVG diagrams are maintained in `docs/diagrams/`:
 
 - **`architecture.svg`** — High-level architecture showing all GCP resources: Cloud Scheduler, Cloud Workflows, Cloud Build (with Git Clone and API Fetch tracks), GCS bucket, Vertex AI RAG Engine (Embedding → Vector Store → Retrieval → Metadata Filter), consumers (Gemini, Claude Code, Claude/OpenAI, MCP Server), Cloud Monitoring, and Service Account. Infrastructure-as-code layer shows Terraform and GitHub Actions CI.
 
-- **`ingestion_pipeline.svg`** — Detailed 6-step pipeline design: Scheduler → Workflows (setup_corpus) → Cloud Build (parallel tracks with all scripts, process-docs section splitting, fetch configurations, generate-metadata) → GCS staging → Vertex AI RAG Engine (chunk, embed, index, validate) → cache warming.
+- **`ingestion_pipeline.svg`** — Detailed pipeline design: Scheduler → Workflows (validate corpus_id) → Cloud Build (parallel tracks with all scripts, process-docs section splitting, fetch configurations, generate-metadata) → GCS staging → Vertex AI RAG Engine (chunk, embed, index, validate) → cache warming.
 
 Both use a dark theme (`#0a0a0f` background) with high-contrast colored lines and text. They are linked from the README using centered `<p align="center">` HTML blocks.
 
@@ -566,9 +575,9 @@ Both use a dark theme (`#0a0a0f` background) with high-contrast colored lines an
 
 ## Token Efficiency
 
-The RAG corpus provides significant token savings compared to pasting raw documentation into LLM context windows. With `top_k=5` and 500-token chunks, a typical retrieval returns 2,000–4,000 tokens of focused, relevant content — compared to 8,000–12,000+ tokens when pasting full documentation pages. For cross-product queries, the savings compound: a question spanning three products retrieves ~4,000 tokens from the corpus versus ~25,000 tokens from raw sources.
+The RAG corpus provides significant token savings compared to pasting raw documentation into LLM context windows. With `top_k=3` and 1024-token chunks, a typical retrieval returns 900–2,000 tokens of focused, relevant content — compared to 8,000–12,000+ tokens when pasting full documentation pages. At retrieval time, metadata header prefixes are stripped from chunks and near-identical content across different source documents is deduplicated by content fingerprint, further reducing token waste. For cross-product queries, the savings compound: a question spanning three products retrieves ~2,000 tokens from the corpus versus ~25,000 tokens from raw sources.
 
-This efficiency gain is a direct consequence of the two-stage chunking strategy: semantic pre-splitting ensures each chunk is a coherent content unit, and the vector similarity search returns only the chunks most relevant to the query.
+This efficiency gain is a direct consequence of the multi-stage optimisation pipeline: semantic pre-splitting with code block compression at ingestion, minimal chunk overlap (20 tokens), larger chunk size (1024 tokens) matching pre-split sections, semantic reranking at retrieval, per-document and cross-document content deduplication, metadata header stripping, and a compact output format that minimises framing overhead.
 
 ---
 

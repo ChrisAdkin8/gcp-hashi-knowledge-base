@@ -12,7 +12,7 @@ Nomad, Packer, Boundary, Waypoint).
 | Category | Command |
 | :--- | :--- |
 | **Deploy** | `task up REPO_URI={url}` |
-| **Docs pipeline** | `task docs:run` (corpus auto-provisioned on first run by `setup_corpus`) |
+| **Docs pipeline** | `task docs:run` (requires `corpus.auto.tfvars` — run `task corpus:create` first) |
 | **Docs validation** | `task docs:test` |
 | **Graph populate** | `task graph:populate GRAPH_REPO_URIS="https://github.com/org/infra"` |
 | **Graph validate** | `task graph:test` |
@@ -23,16 +23,19 @@ Nomad, Packer, Boundary, Waypoint).
 
 ## Architectural Pillars
 
-* **Idempotency**: The RAG corpus is **not** a Terraform resource - the
+* **Idempotency**: The RAG corpus is **not** a Terraform resource — the
   `google_vertex_ai_rag_corpus` resource does not exist in google provider 6.x.
-  The corpus is auto-provisioned by the `setup_corpus` step in
-  `workflows/rag_pipeline.yaml`: it lists corpora, matches by display name, and
-  creates one if none is found. Every pipeline run is self-healing.
+  The corpus is created once by `scripts/create_corpus.py` (get-or-create) and
+  its ID is persisted in `terraform/corpus.auto.tfvars`. The scheduler and all
+  manual triggers pass the corpus ID to the workflow, which fails fast if it is
+  missing.
 * **Semantic Chunking**: `process_docs.py` splits docs at `##`/`###` heading
   boundaries before upload. Vertex AI RAG Engine then applies
-  `fixed_length_chunking` (500 tokens, 100 overlap) during import - the
-  pre-splitting ensures chunk boundaries land on structural boundaries rather
-  than mid-sentence.
+  `fixed_length_chunking` (1024 tokens, 20 overlap) during import — the
+  larger chunk size matches pre-split section sizes closely, so the chunker
+  rarely introduces additional splits. Retrieval uses semantic reranking,
+  per-document deduplication, cross-document content fingerprinting, and
+  metadata header stripping to maximise signal per token.
 * **Metadata Engine**: `generate_metadata.py` produces a `metadata.jsonl` map
   for precision filtering. Supports `product_family` and `source_type` facets.
 * **Spanner Graph (opt-in)**: `terraform plan` over workspace repos is parsed
@@ -49,7 +52,7 @@ Nomad, Packer, Boundary, Waypoint).
 | :--- | :--- |
 | **Project ID** | _set in `terraform/terraform.tfvars`_ |
 | **Region** | `us-central1` (default; configurable via `region` var) |
-| **Corpus** | Auto-provisioned by `workflows/rag_pipeline.yaml` |
+| **Corpus** | Created by `scripts/create_corpus.py`; ID stored in `terraform/corpus.auto.tfvars` |
 | **Spanner instance** | `hashicorp-rag-graph` (only when `create_graph_store = true`) |
 | **Workflow (docs)** | `workflows/rag_pipeline.yaml` |
 | **Workflow (graph)** | `workflows/graph_pipeline.yaml` (TBD) |
@@ -69,7 +72,7 @@ Nomad, Packer, Boundary, Waypoint).
   is enabled) `roles/spanner.databaseUser`.
 * **Filtering syntax**: Use **CEL** for retrieval filters:
   `metadata.product_family == "nomad"`.
-* **Chunking**: The workflow uses `fixed_length_chunking` (500 tokens, 100
+* **Chunking**: The workflow uses `fixed_length_chunking` (1024 tokens, 20
   overlap) in `workflows/rag_pipeline.yaml`. Pre-split content alignment is
   handled by `process_docs.py` and `fetch_blogs.py`.
 

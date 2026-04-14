@@ -26,8 +26,9 @@ Clone it, set a few variables, and run `task up` — a single command
 provisions all docs-side infrastructure and ingests the documentation. The
 graph store is opt-in: set `create_graph_store = true`, list your workspace
 repos in `graph_repo_uris`, re-apply, and run `task graph:populate`. The RAG
-corpus is auto-provisioned by the workflow on the first pipeline run. No
-GitHub App installation, no PATs, no manual steps.
+corpus is created once by `scripts/create_corpus.py` (get-or-create) and its
+ID is passed to every workflow execution via Terraform. No GitHub App
+installation, no PATs, no manual steps.
 
 ---
 
@@ -109,6 +110,7 @@ The full metadata (`product`, `product_family`, `source_type`, `file_name`) is s
 ## Prerequisites
 
 - **GCP project** with billing enabled
+- **GCP IAM roles** — the deploying user needs 12 project-level roles (see [Deployer IAM roles](docs/RUNBOOK.md#deployer-iam-roles) for the full list and a grant-all script)
 - **gcloud CLI** installed and authenticated (see step 2 below)
 - **Terraform** >= 1.5, < 2.0
 - **Python** 3.11+
@@ -172,8 +174,9 @@ The full metadata (`product`, `product_family`, `source_type`, `file_name`) is s
    |------|-------------|
    | 0 | Preflight checks — tools, auth, Python packages, repo files, Terraform validation |
    | 1 | GCS state bucket created and Terraform initialised with remote backend |
-   | 2 | All GCP infrastructure provisioned (`terraform apply`) — service account, IAM, GCS bucket, workflow, scheduler, Document AI processor |
-   | 3 | First pipeline run triggered — the workflow auto-provisions the RAG corpus on this run |
+   | 2 | RAG corpus created (or existing one found) — ID written to `terraform/corpus.auto.tfvars` |
+   | 3 | All GCP infrastructure provisioned (`terraform apply`) — service account, IAM, GCS bucket, workflow, scheduler, Document AI processor. The scheduler includes the corpus ID in every workflow invocation. |
+   | 4 | First pipeline run triggered with the corpus ID |
 
    Each step is idempotent — re-running `task up` safely skips completed steps.
 
@@ -226,6 +229,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 |---|---|---|---|
 | `project_id` | string | (required) | GCP project ID |
 | `region` | string | `"us-central1"` | GCP region for all resources |
+| `corpus_id` | string | (required) | Vertex AI RAG corpus ID — created by `scripts/create_corpus.py`, stored in `terraform/corpus.auto.tfvars` |
 | `cloudbuild_repo_uri` | string | (required) | GitHub HTTPS URL of this repo — Cloud Build clones it to access pipeline scripts (no PAT needed for public repos) |
 | `refresh_schedule` | string | `"0 2 * * 0"` | Cron schedule for docs pipeline refresh |
 | `scheduler_timezone` | string | `"Europe/London"` | Timezone for Cloud Scheduler |
@@ -240,7 +244,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 | `graph_repo_uris` | list(string) | `[]` | HTTPS git URLs of Terraform workspace repos to ingest |
 | `spanner_instance_name` | string | `"hashicorp-rag-graph"` | Spanner instance name |
 | `spanner_instance_config` | string | `"regional-us-central1"` | Spanner instance config |
-| `spanner_processing_units` | number | `100` | Spanner PU (multiple of 100; 100 PU ≈ $65/mo) |
+| `spanner_processing_units` | number | `100` | Spanner PU (multiple of 100; 100 PU + ENTERPRISE edition ≈ $65/mo) |
 | `spanner_database_name` | string | `"tf-graph"` | Spanner database name |
 | `spanner_database_deletion_protection` | bool | `true` | Block accidental destroy |
 | `graph_refresh_schedule` | string | `"0 3 * * 0"` | Cron for the weekly graph refresh |
@@ -268,7 +272,7 @@ rag_retrieval_tool = Tool.from_retrieval(
     retrieval=rag.Retrieval(
         source=rag.VertexRagStore(
             rag_resources=[rag_resource],
-            similarity_top_k=5,
+            similarity_top_k=3,
             vector_distance_threshold=0.3,
         ),
     ),
@@ -323,8 +327,8 @@ response = rag.retrieval_query(
         rag_corpus="projects/PROJECT_ID/locations/REGION/ragCorpora/CORPUS_ID",
     )],
     text="How do I use Vault dynamic secrets with Terraform?",
-    similarity_top_k=5,
-    vector_distance_threshold=0.3,
+    similarity_top_k=3,
+    vector_distance_threshold=0.28,
 )
 context = "\n\n---\n\n".join(
     ctx.text for ctx in response.contexts.contexts
@@ -370,15 +374,16 @@ Most RAG tutorials demonstrate fixed-length chunking — splitting every N token
 
 ### How this pipeline solves it: semantic pre-splitting
 
-Documents are split at `##` and `###` heading boundaries before upload — by `process_docs.py` for docs, providers, modules, and sentinel content, and by `fetch_blogs.py` for blog posts. Vertex AI RAG Engine then applies `fixed_length_chunking` (500 tokens, 100-token overlap) during import. The pre-splitting ensures that the 500-token windows land on structural boundaries rather than mid-sentence or mid-code-block.
+Documents are split at `##` and `###` heading boundaries before upload — by `process_docs.py` for docs, providers, modules, and sentinel content, and by `fetch_blogs.py` for blog posts. Vertex AI RAG Engine then applies `fixed_length_chunking` (1024 tokens, 20-token overlap) during import. The pre-splitting ensures that the 1024-token windows land on structural boundaries rather than mid-sentence or mid-code-block.
 
 - Sections smaller than 200 characters are merged with the previous section to avoid tiny fragments
-- Sections larger than 4,000 characters are split at code-fence boundaries to prevent oversized embeddings
+- Sections larger than 2,000 characters are split at code-fence boundaries to keep sections within the 1024-token chunk window
+- Code blocks are compressed before splitting (comments stripped, blank lines collapsed) to reduce per-chunk token count
 - Single-section documents preserve their original path structure
 - Multi-section documents are written as `{stem}_s0.md`, `{stem}_s1.md`, etc.
 - Each section carries a `section_title` value embedded in its compact body prefix
 
-This approach means chunks align with natural document structure — "Argument Reference", "Example Usage", "Import" each become their own embedding. A query for "aws_instance arguments" retrieves the argument table chunk, not a 500-token window that starts mid-table and ends mid-example.
+This approach means chunks align with natural document structure — "Argument Reference", "Example Usage", "Import" each become their own embedding. A query for "aws_instance arguments" retrieves the argument table chunk, not an arbitrary fixed-length window that starts mid-table and ends mid-example.
 
 ---
 
@@ -492,8 +497,8 @@ response = rag.retrieval_query(
         rag_corpus="projects/PROJECT_ID/locations/REGION/ragCorpora/CORPUS_ID",
     )],
     text="How do I configure an S3 backend in Terraform?",
-    similarity_top_k=5,
-    vector_distance_threshold=0.3,
+    similarity_top_k=3,
+    vector_distance_threshold=0.28,
 )
 
 rag_context = "\n\n---\n\n".join(
@@ -505,16 +510,16 @@ print(f"RAG context: {rag_tokens:,} tokens")
 print(f"Chunks retrieved: {len(response.contexts.contexts)}")
 ```
 
-With `top_k=5` and semantically-split section chunks, the retrieved context is typically **1,500–3,000 tokens** — each chunk is a complete document section that directly addresses the query, with no token budget wasted on adjacent sections or metadata boilerplate.
+With `top_k=3` and semantically-split section chunks, the retrieved context is typically **900–2,000 tokens** — each chunk is a complete document section that directly addresses the query, with no token budget wasted on adjacent sections or metadata boilerplate. At retrieval time, metadata header prefixes are stripped from chunks (the source URI already conveys this information), and near-identical chunks from different source documents are deduplicated by content fingerprint.
 
 ### Step 3: Compare
 
 | Approach | Tokens | Content quality |
 |---|---|---|
 | Raw docs (full pages) | 8,000–12,000 | Includes navigation boilerplate, unrelated sections, version history |
-| RAG retrieval (top 5 chunks) | 1,500–3,000 | Only the relevant sections: configuration block, required arguments, example HCL |
+| RAG retrieval (top 3 chunks) | 900–2,000 | Only the relevant sections: configuration block, required arguments, example HCL |
 
-**Result:** The RAG approach uses **75–85% fewer tokens** while providing more focused context. This translates directly to:
+**Result:** The RAG approach uses **80–90% fewer tokens** while providing more focused context. This translates directly to:
 
 - **Lower cost** — fewer input tokens per API call
 - **Faster responses** — less context for the model to process

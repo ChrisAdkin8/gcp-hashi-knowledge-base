@@ -4,6 +4,8 @@ resource "google_spanner_instance" "graph" {
   config           = var.spanner_instance_config
   display_name     = var.spanner_instance_name
   processing_units = var.spanner_processing_units
+  edition          = "ENTERPRISE"
+  force_destroy    = true
 
   labels = local.common_labels
 

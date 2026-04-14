@@ -32,3 +32,8 @@ output "document_ai_processor_id" {
   description = "ID of the Document AI layout parser processor."
   value       = google_document_ai_processor.layout_parser.id
 }
+
+output "corpus_id" {
+  description = "Vertex AI RAG corpus ID (passed through from input variable)."
+  value       = var.corpus_id
+}

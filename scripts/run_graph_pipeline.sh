@@ -79,10 +79,10 @@ fi
 
 # graph_repo_uris and cloudbuild_repo_uri come from terraform.tfvars (not
 # outputs); read them with `terraform console` for accuracy.
-GRAPH_REPO_URIS=$(terraform -chdir="${TF_DIR}" console <<<'jsonencode(var.graph_repo_uris)' 2>/dev/null | python3 -c "import sys,json;print(json.loads(json.load(sys.stdin)))" 2>/dev/null || echo "[]")
-CLOUDBUILD_REPO_URI=$(terraform -chdir="${TF_DIR}" console <<<'var.cloudbuild_repo_uri' 2>/dev/null | tr -d '"' || echo "")
-MACHINE_TYPE=$(terraform -chdir="${TF_DIR}" console <<<'var.graph_cloudbuild_machine_type' 2>/dev/null | tr -d '"' || echo "E2_HIGHCPU_8")
-BUILD_TIMEOUT_SECONDS=$(terraform -chdir="${TF_DIR}" console <<<'var.graph_build_timeout_seconds' 2>/dev/null || echo "1800")
+GRAPH_REPO_URIS=$(terraform -chdir="${TF_DIR}" console <<<'jsonencode(var.graph_repo_uris)' 2>/dev/null | tail -1 | python3 -c "import sys,json;print(json.loads(json.load(sys.stdin)))" 2>/dev/null || echo "[]")
+CLOUDBUILD_REPO_URI=$(terraform -chdir="${TF_DIR}" console <<<'var.cloudbuild_repo_uri' 2>/dev/null | tail -1 | tr -d '"' || echo "")
+MACHINE_TYPE=$(terraform -chdir="${TF_DIR}" console <<<'var.graph_cloudbuild_machine_type' 2>/dev/null | tail -1 | tr -d '"' || echo "E2_HIGHCPU_8")
+BUILD_TIMEOUT_SECONDS=$(terraform -chdir="${TF_DIR}" console <<<'var.graph_build_timeout_seconds' 2>/dev/null | tail -1 || echo "1800")
 
 ARGUMENT_JSON=$(python3 - <<PY
 import json

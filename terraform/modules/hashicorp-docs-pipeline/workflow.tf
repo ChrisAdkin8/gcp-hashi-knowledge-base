@@ -4,7 +4,7 @@ resource "google_workflows_workflow" "rag_pipeline" {
   region              = var.region
   description         = "Orchestrates the HashiCorp RAG documentation ingestion pipeline."
   service_account     = google_service_account.rag_pipeline.id
-  deletion_protection = true
+  deletion_protection = false
   source_contents     = file(var.workflow_source_path)
 
   depends_on = [google_project_service.apis]

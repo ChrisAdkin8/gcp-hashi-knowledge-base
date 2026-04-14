@@ -21,8 +21,15 @@ Authentication uses Google Application Default Credentials (ADC).
 Run `gcloud auth application-default login` before starting the server.
 """
 
+import hashlib
 import logging
 import os
+
+# Spanner Python client v3.49+ auto-enables OpenTelemetry metrics export, but
+# local / Cloud Build runs lack the required resource labels (instance_id),
+# causing noisy 400 errors against Cloud Monitoring.  Disable built-in metrics.
+os.environ.setdefault("GOOGLE_CLOUD_SPANNER_ENABLE_BUILTIN_METRICS", "false")
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -149,6 +156,35 @@ def _extract_uri_metadata(source_uri: str) -> dict[str, str]:
     return {"product": "", "product_family": "", "source_type": ""}
 
 
+def _short_source_uri(source_uri: str) -> str:
+    """Return a compact, human-readable path from a full GCS URI.
+
+    Strips the ``gs://bucket/`` prefix, leaving only the object path.
+    Falls back to the original string when the URI is not a GCS path.
+    """
+    if source_uri.startswith("gs://"):
+        parts = source_uri.split("/", 3)  # ["gs:", "", "bucket", "rest"]
+        if len(parts) > 3:
+            return parts[3]
+    return source_uri
+
+
+def _strip_chunk_header(text: str) -> str:
+    """Remove the compact metadata header prefix injected by process_docs.py.
+
+    The header (e.g. ``[provider:aws] aws_instance — Arguments\\n\\n``) is
+    already conveyed by the source URI, so repeating it in every chunk wastes
+    tokens.
+    """
+    return re.sub(r'^\[[\w./-]+:[\w./-]*\]\s+.*?\n\n', '', text, count=1)
+
+
+def _content_fingerprint(text: str) -> str:
+    """Return a short hash of normalised text for near-duplicate detection."""
+    normalised = re.sub(r'\s+', ' ', text.lower()).strip()
+    return hashlib.sha256(normalised.encode('utf-8')).hexdigest()[:16]
+
+
 def _matches_metadata(
     source_uri: str,
     product: str | None,
@@ -195,8 +231,8 @@ mcp = FastMCP(
 @mcp.tool()
 def search_hashicorp_docs(
     query: str,
-    top_k: int = 5,
-    distance_threshold: float = 0.35,
+    top_k: int = 3,
+    distance_threshold: float = 0.28,
     product: str | None = None,
     product_family: str | None = None,
     source_type: str | None = None,
@@ -209,8 +245,8 @@ def search_hashicorp_docs(
 
     Args:
         query: Natural language question or topic to search for.
-        top_k: Number of results to return. Range 1–20, default 5.
-        distance_threshold: Relevance cutoff. Range 0.1–1.0, default 0.35.
+        top_k: Number of results to return. Range 1–20, default 3.
+        distance_threshold: Relevance cutoff. Range 0.1–1.0, default 0.28.
             Lower values are stricter (only close matches). Raise to 0.5+
             for broader but less precise coverage.
         product: Filter by specific product name. Examples: "aws", "vault",
@@ -236,7 +272,7 @@ def search_hashicorp_docs(
 
     # Over-fetch when metadata filters are active so we have enough candidates
     # after post-retrieval filtering to return the requested top_k results.
-    fetch_k = top_k * 10 if any([product, product_family, source_type]) else top_k
+    fetch_k = top_k * 3 if any([product, product_family, source_type]) else top_k
 
     try:
         response = rag.retrieval_query(
@@ -245,6 +281,11 @@ def search_hashicorp_docs(
             rag_retrieval_config=rag.RagRetrievalConfig(
                 top_k=fetch_k,
                 filter=rag.Filter(vector_distance_threshold=distance_threshold),
+                ranking=rag.Ranking(
+                    rank_service=rag.RankService(
+                        model_name="semantic-ranker-512@latest",
+                    ),
+                ),
             ),
         )
     except Exception as exc:
@@ -254,18 +295,42 @@ def search_hashicorp_docs(
     contexts: list[dict] = []
     if response.contexts and response.contexts.contexts:
         for ctx in response.contexts.contexts:
-            text: str = getattr(ctx, "text", "") or ""
+            raw_text: str = getattr(ctx, "text", "") or ""
             uri: str = getattr(ctx, "source_uri", "") or ""
             if _matches_metadata(uri, product, product_family, source_type):
+                # Strip the metadata header — the source URI already identifies the doc.
+                text = _strip_chunk_header(raw_text)
                 contexts.append(
                     {
-                        "source_uri": getattr(ctx, "source_uri", ""),
+                        "source_uri": uri,
                         "score": getattr(ctx, "score", 0.0),
                         "text": text,
                     }
                 )
 
-    contexts = contexts[:top_k]
+    # Deduplicate by source URI — keep only the highest-scoring chunk per document.
+    seen_uris: dict[str, int] = {}
+    deduped: list[dict] = []
+    for ctx in contexts:
+        uri = ctx["source_uri"]
+        if uri in seen_uris:
+            existing_idx = seen_uris[uri]
+            if ctx["score"] > deduped[existing_idx]["score"]:
+                deduped[existing_idx] = ctx
+        else:
+            seen_uris[uri] = len(deduped)
+            deduped.append(ctx)
+
+    # Cross-document dedup: drop chunks with near-identical content from
+    # different source URIs (e.g. the same example in a guide and a provider doc).
+    seen_fingerprints: set[str] = set()
+    unique: list[dict] = []
+    for ctx in deduped:
+        fp = _content_fingerprint(ctx["text"])
+        if fp not in seen_fingerprints:
+            seen_fingerprints.add(fp)
+            unique.append(ctx)
+    contexts = unique[:top_k]
 
     if not contexts:
         active_filters: list[str] = []
@@ -280,10 +345,8 @@ def search_hashicorp_docs(
 
     lines: list[str] = [f'Found {len(contexts)} result(s) for: "{query}"\n']
     for i, ctx in enumerate(contexts, 1):
-        lines.append(f"--- Result {i} ---")
-        lines.append(f"Source: {ctx['source_uri']}")
-        lines.append(f"Score:  {ctx['score']:.4f}")
-        lines.append("Text:")
+        short_source = _short_source_uri(ctx["source_uri"])
+        lines.append(f"[{i}] {short_source} ({ctx['score']:.2f})")
         lines.append(ctx["text"])
         lines.append("")
 
@@ -317,8 +380,8 @@ def get_corpus_info() -> str:
         "  source_type:    provider | documentation | module | sentinel | issue | discuss | blog",
         "",
         "Default retrieval settings:",
-        "  top_k:              5  (range 1–20)",
-        "  distance_threshold: 0.35  (range 0.1–1.0; lower = stricter)",
+        "  top_k:              3  (range 1–20)",
+        "  distance_threshold: 0.28  (range 0.1–1.0; lower = stricter)",
     ]
     return "\n".join(lines)
 

@@ -11,6 +11,7 @@ resource "google_cloud_scheduler_job" "rag_weekly_refresh" {
     uri         = "https://workflowexecutions.googleapis.com/v1/projects/${var.project_id}/locations/${var.region}/workflows/${google_workflows_workflow.rag_pipeline.name}/executions"
     body = base64encode(jsonencode({
       argument = jsonencode({
+        corpus_id       = var.corpus_id
         bucket_name     = local.rag_bucket_name
         region          = var.region
         repo_url        = var.cloudbuild_repo_uri

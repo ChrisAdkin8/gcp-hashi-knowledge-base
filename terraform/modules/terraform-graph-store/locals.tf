@@ -17,12 +17,14 @@ locals {
   ])
 
   // Roles that have no resource-level equivalent and must be granted at the
-  // project scope. Database- and bucket-scoped bindings are declared
-  // separately in iam.tf. workflows.invoker stays project-level because the
-  // Google provider does not expose `google_workflows_workflow_iam_member`.
+  // project scope. Bucket-scoped bindings are declared separately in iam.tf.
+  // spanner.databaseUser is project-level because the doormat org policy
+  // blocks spanner.databases.setIamPolicy. workflows.invoker stays
+  // project-level because the provider has no workflow-level IAM resource.
   service_account_project_roles = toset([
     "roles/cloudbuild.builds.editor",
     "roles/logging.logWriter",
+    "roles/spanner.databaseUser",
     "roles/workflows.invoker",
   ])
 

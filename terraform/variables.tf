@@ -62,6 +62,17 @@ variable "cloudbuild_repo_uri" {
   }
 }
 
+variable "corpus_id" {
+  type        = string
+  default     = ""
+  description = "Vertex AI RAG corpus ID. Created outside Terraform by scripts/create_corpus.py and written to corpus.auto.tfvars."
+
+  validation {
+    condition     = var.corpus_id == "" || can(regex("^[0-9]+$", var.corpus_id))
+    error_message = "corpus_id must be a numeric string (e.g. \"1234567890\")."
+  }
+}
+
 variable "embedding_model" {
   type        = string
   description = "Vertex AI embedding model resource path."
@@ -103,13 +114,13 @@ variable "notification_email" {
 variable "create_graph_store" {
   type        = bool
   description = "If true, deploy the Spanner-backed Terraform dependency-graph pipeline."
-  default     = false
+  default     = true
 }
 
 variable "graph_repo_uris" {
   type        = list(string)
   description = "GitHub HTTPS URLs of Terraform workspace repositories whose dependency graphs should be ingested into Spanner."
-  default     = []
+  default     = ["https://github.com/ChrisAdkin8/gcp-hashi-knowledge-base.git"]
 }
 
 variable "spanner_instance_name" {

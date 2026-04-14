@@ -78,18 +78,21 @@ def extract_corpus_id(corpus_name: str) -> str:
     return match.group(1)
 
 
-def create_corpus(
+def get_or_create_corpus(
     project_id: str,
     region: str,
     display_name: str,
     embedding_model: str,
 ) -> tuple[str, str]:
-    """Create a Vertex AI RAG corpus.
+    """Return an existing corpus matching *display_name*, or create one.
+
+    This is the primary entry point.  It eliminates the race condition that
+    caused duplicate corpora when the old workflow auto-provisioned on every run.
 
     Args:
         project_id: GCP project ID.
         region: GCP region.
-        display_name: Human-readable corpus name.
+        display_name: Human-readable corpus name to match or create.
         embedding_model: Vertex AI embedding model resource path.
 
     Returns:
@@ -108,7 +111,17 @@ def create_corpus(
     logger.info("Initialising Vertex AI for project=%s region=%s", project_id, region)
     vertexai.init(project=project_id, location=region)
 
-    logger.info("Creating RAG corpus: %s", display_name)
+    # Check for an existing corpus with the same display name.
+    logger.info("Listing existing RAG corpora …")
+    for corpus in rag.list_corpora():
+        if corpus.display_name == display_name:
+            corpus_name: str = corpus.name
+            corpus_id = extract_corpus_id(corpus_name)
+            logger.info("Found existing corpus: %s (id=%s)", corpus_name, corpus_id)
+            return corpus_name, corpus_id
+
+    # No match — create a new one.
+    logger.info("No corpus named %r found — creating …", display_name)
     embedding_config = rag.RagEmbeddingModelConfig(
         vertex_prediction_endpoint=rag.VertexPredictionEndpoint(
             publisher_model=embedding_model,
@@ -122,8 +135,9 @@ def create_corpus(
         backend_config=backend_config,
     )
 
-    corpus_name: str = corpus.name
+    corpus_name = corpus.name
     corpus_id = extract_corpus_id(corpus_name)
+    logger.info("Created corpus: %s (id=%s)", corpus_name, corpus_id)
     return corpus_name, corpus_id
 
 
@@ -136,7 +150,7 @@ def main() -> None:
         for handler in logging.getLogger().handlers:
             handler.stream = sys.stderr  # type: ignore[attr-defined]
 
-    corpus_name, corpus_id = create_corpus(
+    corpus_name, corpus_id = get_or_create_corpus(
         project_id=args.project_id,
         region=args.region,
         display_name=args.display_name,

@@ -41,7 +41,7 @@ Vertex AI RAG Engine
 HashiCorp documentation corpus
 (Terraform providers, Vault, Consul, Nomad,
  Packer, Sentinel, GitHub issues, Discourse,
- blog posts — ~1 024-token chunks)
+ blog posts — ~1024-token chunks)
 ```
 
 When Claude Code needs information about a HashiCorp product, it calls
@@ -159,8 +159,8 @@ Search the HashiCorp documentation corpus for semantically relevant chunks.
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `query` | string | yes | — | Natural language question or topic. |
-| `top_k` | integer | no | `5` | Number of results to return. Range: 1–20. |
-| `distance_threshold` | float | no | `0.35` | Relevance cutoff. Range: 0.1–1.0. Lower = stricter. |
+| `top_k` | integer | no | `3` | Number of results to return. Range: 1–20. |
+| `distance_threshold` | float | no | `0.28` | Relevance cutoff. Range: 0.1–1.0. Lower = stricter. |
 | `product` | string | no | — | Filter by product name (see below). |
 | `product_family` | string | no | — | Filter by product family (see below). |
 | `source_type` | string | no | — | Filter by document source type (see below). |
@@ -197,20 +197,18 @@ indexed in the corpus.
 
 **Output format**
 
+Results use a compact format to minimise token overhead. Each result has a single-line header with the source path (GCS bucket prefix stripped) and relevance score, followed by the chunk text. Three levels of deduplication are applied: per-document (only the highest-scoring chunk per source URI), cross-document (near-identical content from different sources is fingerprinted and collapsed), and metadata stripping (the `[source_type:product]` header prefix is removed from chunk bodies since the source URI already conveys this). Results are reranked using `semantic-ranker-512@latest`.
+
 ```
 Found 3 result(s) for: "How do I configure the AWS provider?"
 
---- Result 1 ---
-Source: https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/...
-Score:  0.8712
-Text:
-source_type: provider
-product: aws
-product_family: terraform
-...full chunk text...
+[1] provider/terraform-provider-aws/website/docs/r/instance.md (0.87)
+[provider:aws] aws_instance — Argument Reference
+...chunk text...
 
---- Result 2 ---
-...
+[2] provider/terraform-provider-aws/website/docs/d/ami.md (0.81)
+[provider:aws] aws_ami — Data Source Reference
+...chunk text...
 ```
 
 **Example calls**
@@ -254,8 +252,8 @@ Metadata filters available in search_hashicorp_docs:
   source_type:    provider | documentation | module | sentinel | issue | discuss | blog
 
 Default retrieval settings:
-  top_k:              5  (range 1–20)
-  distance_threshold: 0.35  (range 0.1–1.0; lower = stricter)
+  top_k:              3  (range 1–20)
+  distance_threshold: 0.28  (range 0.1–1.0; lower = stricter)
 ```
 
 ---
@@ -378,7 +376,7 @@ The corpus ID in `VERTEX_CORPUS_ID` does not match the corpus in the project/
 region pair. Confirm the correct ID:
 
 ```bash
-task output  # shows corpus_resource_name from Terraform
+task output  # shows corpus_id from Terraform
 ```
 
 ### Server does not appear in Claude Code
@@ -402,7 +400,8 @@ task mcp:install
 Post-retrieval metadata filtering reduces the result count. The server
 over-fetches (`top_k × 3`) when filters are active, but if the corpus contains
 few documents matching the filter combination, the result count will be low.
-Options:
+Cross-document content deduplication may further reduce the count if multiple
+sources contain near-identical text. Options:
 
 - Raise `distance_threshold` to 0.5 or higher to widen the candidate set.
 - Remove one of the filters (e.g. drop `source_type` and keep only

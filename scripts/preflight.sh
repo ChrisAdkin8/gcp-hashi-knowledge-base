@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REGION="${1:-us-central1}"
+REGION="${1:-us-west1}"
 PYTHON="${2:-.venv/bin/python3}"
 TF_DIR="${3:-terraform}"
 
@@ -51,6 +51,21 @@ else
   echo "FAIL: Python $py_ver — need >= 3.11"; exit 1
 fi
 
+# ── Repository origin ────────────────────────────────────────────────────────
+
+section "Repository origin"
+EXPECTED_REPO="https://github.com/ChrisAdkin8/gcp-hashi-knowledge-base.git"
+origin_url=$(git remote get-url origin 2>/dev/null || echo "")
+if [ -z "$origin_url" ]; then
+  echo "FAIL: No git remote 'origin' configured."; exit 1
+elif [ "$origin_url" = "$EXPECTED_REPO" ] || \
+     [ "$origin_url" = "git@github.com:ChrisAdkin8/gcp-hashi-knowledge-base.git" ]; then
+  echo "OK: origin -> $origin_url"
+else
+  echo "FAIL: origin is '$origin_url', expected '$EXPECTED_REPO'"
+  echo "      Run: git remote set-url origin $EXPECTED_REPO"; exit 1
+fi
+
 # ── GCP authentication ───────────────────────────────────────────────────────
 
 section "GCP authentication"
@@ -77,6 +92,55 @@ else
   echo "FAIL: Cannot access project $PROJECT_ID."; exit 1
 fi
 echo "OK: Region $REGION"
+
+# ── Deployer IAM roles ──────────────────────────────────────────────────────
+
+section "Deployer IAM roles"
+iam_fail=0
+
+REQUIRED_ROLES=(
+  roles/serviceusage.serviceUsageAdmin
+  roles/iam.serviceAccountAdmin
+  roles/iam.serviceAccountUser
+  roles/resourcemanager.projectIamAdmin
+  roles/storage.admin
+  roles/workflows.admin
+  roles/cloudscheduler.admin
+  roles/cloudbuild.builds.editor
+  roles/documentai.editor
+  roles/monitoring.editor
+  roles/aiplatform.user
+  roles/spanner.databaseAdmin
+)
+
+# Fetch the IAM policy once and extract the roles granted to the active account.
+iam_policy=$(gcloud projects get-iam-policy "$PROJECT_ID" \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:$acct" \
+  --format="value(bindings.role)" 2>/dev/null || echo "")
+
+if [ -z "$iam_policy" ]; then
+  echo "WARN: Could not fetch IAM policy (need resourcemanager.projects.getIamPolicy)."
+  echo "      Skipping role checks — verify manually that the deployer has the required roles."
+  echo "      See docs/RUNBOOK.md#deployer-iam-roles for the full list."
+else
+  for role in "${REQUIRED_ROLES[@]}"; do
+    if echo "$iam_policy" | grep -qx "$role"; then
+      echo "OK: $role"
+    else
+      echo "MISSING: $role"; iam_fail=1
+    fi
+  done
+  if [ "$iam_fail" -ne 0 ]; then
+    echo ""
+    echo "Grant missing roles with:"
+    echo "  gcloud projects add-iam-policy-binding $PROJECT_ID \\"
+    echo "    --member=\"user:$acct\" --role=\"<ROLE>\""
+    echo ""
+    echo "Or see docs/RUNBOOK.md#deployer-iam-roles for a grant-all script."
+    exit 1
+  fi
+fi
 
 # ── Python packages ──────────────────────────────────────────────────────────
 

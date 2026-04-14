@@ -1,5 +1,55 @@
 # Runbook — HashiCorp RAG Pipeline
 
+## Deployer IAM roles
+
+The authenticated user (or service account) running `task up` must hold the
+following project-level IAM roles. These are the minimum permissions required to
+create all resources managed by Terraform and the helper scripts.
+
+| Role | Why |
+|---|---|
+| `roles/serviceusage.serviceUsageAdmin` | Enable GCP APIs |
+| `roles/iam.serviceAccountAdmin` | Create pipeline service accounts |
+| `roles/iam.serviceAccountUser` | Bind `actAs` on service accounts |
+| `roles/resourcemanager.projectIamAdmin` | Grant project-level IAM bindings to service accounts |
+| `roles/storage.admin` | Create GCS buckets and manage bucket IAM |
+| `roles/workflows.admin` | Create Cloud Workflows |
+| `roles/cloudscheduler.admin` | Create Cloud Scheduler jobs |
+| `roles/cloudbuild.builds.editor` | Trigger Cloud Build jobs |
+| `roles/documentai.editor` | Create Document AI processors |
+| `roles/monitoring.editor` | Create alert policies and notification channels |
+| `roles/aiplatform.user` | Create / query Vertex AI RAG corpus |
+| `roles/spanner.databaseAdmin` | Create Spanner instances and databases (graph store) |
+
+Grant all roles in one pass:
+
+```bash
+PROJECT_ID=hc-29701ed7d0f941d69ba588097b7
+USER=chris.adkin@hashicorp.com
+
+for role in \
+  roles/serviceusage.serviceUsageAdmin \
+  roles/iam.serviceAccountAdmin \
+  roles/iam.serviceAccountUser \
+  roles/resourcemanager.projectIamAdmin \
+  roles/storage.admin \
+  roles/workflows.admin \
+  roles/cloudscheduler.admin \
+  roles/cloudbuild.builds.editor \
+  roles/documentai.editor \
+  roles/monitoring.editor \
+  roles/aiplatform.user \
+  roles/spanner.databaseAdmin; do
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="user:$USER" --role="$role"
+done
+```
+
+The preflight check (`task preflight:auth`) verifies these bindings
+automatically — run it to see which roles are missing before deploying.
+
+---
+
 ## Initial deployment
 
 The entire pipeline — infrastructure, corpus creation, and first data ingestion — is deployed with a single command:
@@ -10,14 +60,15 @@ task up REPO_URI=https://github.com/my-org/hashicorp-vertex-ai-rag
 
 `PROJECT_ID` is auto-detected from `gcloud config`. Override with `PROJECT_ID=<id>` if needed.
 
-`task up` runs preflight checks first, then calls `scripts/deploy.sh`, which runs three idempotent steps:
+`task up` runs preflight checks first, then calls `scripts/deploy.sh`, which runs four idempotent steps:
 
-0. **Preflight** — validates CLI tools (terraform >= 1.5, gcloud, python3 >= 3.11, jq, shellcheck), GCP authentication and project access, Python packages (`google-cloud-aiplatform`, `pyyaml`, `requests`, `pytest`, `beautifulsoup4`), repository file integrity, and Terraform formatting/validation
+0. **Preflight** — validates CLI tools (terraform >= 1.5, gcloud, python3 >= 3.11, jq, shellcheck), GCP authentication and project access, deployer IAM roles (see above), Python packages (`google-cloud-aiplatform`, `pyyaml`, `requests`, `pytest`, `beautifulsoup4`), repository file integrity, and Terraform formatting/validation
 1. **Bootstrap** — creates the GCS state bucket and initialises Terraform remote backend
-2. **Apply** — provisions all GCP resources (service account, IAM, GCS bucket, Cloud Workflows workflow, Cloud Scheduler job, Document AI processor, monitoring)
-3. **Pipeline** — triggers the first data ingestion run. The workflow auto-provisions the RAG corpus on this first run if one does not already exist.
+2. **Corpus** — calls `scripts/create_corpus.py` to find an existing RAG corpus by display name or create one. The corpus ID is written to `terraform/corpus.auto.tfvars`.
+3. **Apply** — provisions all GCP resources (service account, IAM, GCS bucket, Cloud Workflows workflow, Cloud Scheduler job, Document AI processor, monitoring). The scheduler includes the corpus ID in every workflow invocation.
+4. **Pipeline** — triggers the first data ingestion run with the corpus ID.
 
-The Vertex AI RAG corpus is **not** a Terraform-managed resource (`google_vertex_ai_rag_corpus` is absent from the Google provider 6.x). The corpus is created automatically by the `setup_corpus` step in the Cloud Workflow: it lists corpora in the project, matches by display name (`HashiCorp-Vertex-RAG-Corpus`), and calls the RAG API to create one if none is found. No separate creation step or `corpus.auto.tfvars` file is needed.
+The Vertex AI RAG corpus is **not** a Terraform-managed resource (`google_vertex_ai_rag_corpus` is absent from the Google provider 6.x). The corpus is created once by `scripts/create_corpus.py` (get-or-create) and its ID is persisted in `terraform/corpus.auto.tfvars`. The workflow requires `corpus_id` as an argument and fails fast if it is missing — it never auto-provisions a corpus.
 
 Re-running `task up` is safe — each step detects existing state and skips automatically.
 
@@ -34,6 +85,7 @@ Or run individual check groups:
 ```bash
 task preflight:tools      # CLI tools and version requirements
 task preflight:auth       # GCP auth, ADC, project access, API status
+task preflight:iam        # Deployer IAM roles (see section above)
 task preflight:python     # Python package availability
 task preflight:files      # Repository file inventory and permissions
 task preflight:terraform  # Terraform fmt and validate
@@ -113,10 +165,10 @@ Common build failures:
 
 ### Step 3 — Check workflow execution errors
 
-If the failure is in `setup_corpus`, `import_to_rag`, or `validate_retrieval`:
+If the failure is in `validate_corpus_id`, `import_to_rag`, or `validate_retrieval`:
 
-- `setup_corpus` failure: the RAG API call to list or create the corpus failed. Check IAM — the service account needs `roles/aiplatform.admin`. Inspect the HTTP response body in the workflow step details.
-- `import_to_rag` failure: the Vertex AI RAG Engine API returned an error. Verify the corpus was created by the `setup_corpus` step earlier in the same execution. Check the workflow step details for the corpus ID that was resolved.
+- `validate_corpus_id` failure: `corpus_id` was not passed to the workflow. Ensure `terraform/corpus.auto.tfvars` exists and contains a valid corpus ID, then re-apply Terraform so the scheduler picks it up. Run `task corpus:create` to generate the file.
+- `import_to_rag` failure: the Vertex AI RAG Engine API returned an error. Verify the corpus ID in `terraform/corpus.auto.tfvars` matches an existing corpus in the project/region. Check the workflow step details for the HTTP response.
 - `validate_retrieval` warning: zero results returned — the corpus may be empty or the import failed silently. Check the import response in the workflow step details.
 
 ### Common Errors
@@ -124,7 +176,7 @@ If the failure is in `setup_corpus`, `import_to_rag`, or `validate_retrieval`:
 | Error | Cause | Fix |
 |---|---|---|
 | `Permission denied on GCS bucket` | Service account missing `storage.objectAdmin` | Re-run `terraform apply` to reconcile IAM |
-| `Corpus not found` | Corpus was deleted out-of-band between pipeline runs | Trigger a new pipeline run — `setup_corpus` will recreate it automatically |
+| `Corpus not found` | Corpus was deleted out-of-band | Run `task corpus:create` to provision a new corpus and update `corpus.auto.tfvars`, then `task apply` to update the scheduler |
 | `Cloud Build timeout` | Too many repos to clone within 7200s | Increase timeout or reduce repo count |
 | `Registry API rate limit` | `discover_modules.py` hit the public API rate limit | Add `GITHUB_TOKEN` environment variable to Cloud Build substitutions |
 | `Workflow execution quota exceeded` | Too many concurrent executions | Check for stuck executions and cancel them |
@@ -181,7 +233,7 @@ task docs:run
 
 ### Option B — Delete and recreate the corpus
 
-The corpus is managed by the workflow, not Terraform. Delete it via the gcloud CLI, then trigger a new pipeline run — `setup_corpus` will recreate it automatically:
+The corpus is not managed by Terraform. Delete it via the gcloud CLI, then recreate it:
 
 ```bash
 # Find the corpus resource name
@@ -190,7 +242,13 @@ gcloud ai rag-corpora list --region=REGION --project=PROJECT_ID
 # Delete the corpus
 gcloud ai rag-corpora delete CORPUS_RESOURCE_NAME --region=REGION --project=PROJECT_ID
 
-# Trigger a fresh run — setup_corpus recreates the corpus
+# Create a new corpus and update corpus.auto.tfvars
+task corpus:create
+
+# Re-apply so the scheduler picks up the new corpus ID
+task plan && task apply
+
+# Trigger a fresh run
 task docs:run
 ```
 
@@ -198,12 +256,14 @@ task docs:run
 
 ## How to Tune Chunking
 
-Chunks are defined by `cloudbuild/scripts/process_docs.py` before upload. Vertex AI RAG Engine imports them with `no_chunking` — no secondary splitting occurs.
+Chunks are defined by `cloudbuild/scripts/process_docs.py` before upload. Vertex AI RAG Engine applies `fixed_length_chunking` (1024 tokens, 20-token overlap) during import. The larger chunk size closely matches the pre-split section sizes, so the chunker rarely introduces additional splits. The minimal overlap reduces redundant token waste across boundaries.
 
 - **Section boundary**: change `MIN_SECTION_SIZE` (default 200 chars) to merge more or fewer small sections.
-- **Large-section split**: change the `max_chars` parameter in `_split_large_section` (default 4000 chars) to control how oversized sections are further split at code-fence boundaries.
+- **Large-section split**: change the `max_chars` parameter in `_split_large_section` (default 2000 chars) to control how oversized sections are further split at code-fence boundaries.
+- **Code block compression**: `_compress_code_blocks()` strips comments and collapses blank lines inside fenced code blocks. Disable by removing the call in `process_file()` if you need verbatim code in chunks.
+- **RAG Engine chunk size**: edit `chunkSize` / `chunkOverlap` in `workflows/rag_pipeline.yaml` (currently 1024 / 20).
 
-After changing either constant, force a full re-import (see above) to apply to the corpus.
+After changing any of these, force a full re-import (see above) to apply to the corpus.
 
 ---
 
@@ -214,7 +274,7 @@ After changing either constant, force a full re-import (see above) to apply to t
    embedding_model = "publishers/google/models/text-embedding-large-exp-03-07"
    ```
 2. Run `terraform apply`.
-3. **Note:** Changing the embedding model requires recreating the corpus, because existing embeddings use the old model's vector space. Delete the corpus via gcloud (see Option B above), then trigger a new pipeline run to recreate it and force a full re-import.
+3. **Note:** Changing the embedding model requires recreating the corpus, because existing embeddings use the old model's vector space. Delete the corpus via gcloud (see Option B above), then run `task corpus:create` to provision a new one, `task apply` to update the scheduler, and `task docs:run` to force a full re-import.
 
 ---
 
@@ -286,7 +346,9 @@ The graph pipeline is opt-in (`create_graph_store = true` in `terraform.tfvars`)
 |---|---|---|
 | `graph_repo_uris is empty - nothing to ingest` | The variable is empty | Set `graph_repo_uris` in tfvars and re-apply, or pass it via the workflow execution argument |
 | `PermissionDenied: spanner.databases.beginOrRollbackReadWriteTransaction` | Service account missing `roles/spanner.databaseUser` | Re-run `terraform apply` |
+| `Feature GRAPH is not available … minimum required Edition is ENTERPRISE` | Spanner instance created with STANDARD edition | Set `edition = "ENTERPRISE"` on the `google_spanner_instance` resource and re-apply |
 | `Table not found: Resource` | Spanner DDL was applied incrementally | All DDL must apply in the same batch — never split CREATE TABLE and CREATE PROPERTY GRAPH across separate `update_ddl` calls |
+| `parse error: extraneous input '{'` in workflow YAML | Inline map literal `{"key": val}` used inside a Workflows `${...}` expression | Build the map in a separate `assign` step as a YAML object, then reference the variable name in `list.concat` |
 | `terraform init` fails on backend block | The strip-backend regex did not match a non-trivial backend declaration | Edit the regex in `workflows/graph_pipeline.yaml` step `terraform-graph` |
 
 ### Re-ingesting a single repo
@@ -295,6 +357,6 @@ The pipeline is authoritative per `repo_uri`: each ingestion run does `DELETE FR
 
 ### Cost notes
 
-- Spanner is the only continuously-billed resource. The default `regional-us-central1` config at 100 PU is roughly **$65/month**.
+- Spanner is the only continuously-billed resource. The default `regional-us-central1` config at 100 PU with ENTERPRISE edition is roughly **$65/month** (ENTERPRISE pricing applies — the GRAPH feature requires it).
 - To pause Spanner billing, set `create_graph_store = false` and apply — the database, instance, and bucket are destroyed (subject to `spanner_database_deletion_protection = false`).
 - DOT snapshots are stored in the staging bucket with a 30-day lifecycle delete.

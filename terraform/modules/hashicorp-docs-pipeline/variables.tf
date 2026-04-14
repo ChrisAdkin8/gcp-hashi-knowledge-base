@@ -64,6 +64,17 @@ variable "environment" {
   }
 }
 
+variable "corpus_id" {
+  type        = string
+  default     = ""
+  description = "Vertex AI RAG corpus ID. Created outside Terraform by scripts/create_corpus.py and passed in via corpus.auto.tfvars."
+
+  validation {
+    condition     = var.corpus_id == "" || can(regex("^[0-9]+$", var.corpus_id))
+    error_message = "corpus_id must be a numeric string (e.g. \"1234567890\")."
+  }
+}
+
 variable "documentai_location" {
   type        = string
   description = "Document AI processor location. Document AI is only available in 'us' or 'eu'."

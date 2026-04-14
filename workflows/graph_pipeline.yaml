@@ -158,15 +158,27 @@ main:
                                         --bucket "${_GRAPH_STAGING_BUCKET}" \
                                         --snapshot-key "${SNAPSHOT_KEY}"
                           result: build_res
+                      - build_success_entry:
+                          assign:
+                            - success_entry:
+                                workspace_repo_uri: ${workspace_repo_uri}
+                                build_id: ${build_res.body.metadata.build.id}
+                                status: "SUCCEEDED"
                       - record_success:
                           assign:
-                            - results: '${list.concat(results, [{"workspace_repo_uri": workspace_repo_uri, "build_id": build_res.body.metadata.build.id, "status": "SUCCEEDED"}])}'
+                            - results: ${list.concat(results, [success_entry])}
                   except:
                     as: e
                     steps:
+                      - build_failure_entry:
+                          assign:
+                            - failure_entry:
+                                workspace_repo_uri: ${workspace_repo_uri}
+                                status: "FAILED"
+                                error: ${e}
                       - record_failure:
                           assign:
-                            - results: '${list.concat(results, [{"workspace_repo_uri": workspace_repo_uri, "status": "FAILED", "error": e}])}'
+                            - results: ${list.concat(results, [failure_entry])}
 
     - smoke_query_spanner:
         # Best-effort sanity check: count nodes via the Spanner REST API.

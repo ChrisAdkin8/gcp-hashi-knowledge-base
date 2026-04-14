@@ -90,7 +90,7 @@ result = _server.search_hashicorp_docs(
     top_k=3,
 )
 print(result[:600])
-check("basic search returns results", result, "Result 1")
+check("basic search returns results", result, "[1]")
 
 # ── 3. Filtered search (product family) ───────────────────────────────────────
 print()
@@ -104,7 +104,7 @@ result_vault = _server.search_hashicorp_docs(
     product_family="vault",
 )
 print(result_vault[:600])
-check("filtered search returns results", result_vault, "Result 1")
+check("filtered search returns results", result_vault, "[1]")
 
 # ── 4. No-results case ─────────────────────────────────────────────────────────
 print()

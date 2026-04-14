@@ -22,6 +22,6 @@ resource "google_storage_bucket" "rag_docs" {
   }
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }

@@ -4,7 +4,7 @@ resource "google_workflows_workflow" "graph_pipeline" {
   region              = var.region
   description         = "Orchestrates the Terraform dependency-graph ingestion pipeline."
   service_account     = google_service_account.graph_pipeline.id
-  deletion_protection = true
+  deletion_protection = false
   source_contents     = file(var.workflow_source_path)
 
   depends_on = [google_project_service.apis]

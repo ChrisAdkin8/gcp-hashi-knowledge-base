@@ -33,6 +33,11 @@ output "document_ai_processor_id" {
   value       = module.hashicorp_docs_pipeline.document_ai_processor_id
 }
 
+output "corpus_id" {
+  description = "Vertex AI RAG corpus ID."
+  value       = module.hashicorp_docs_pipeline.corpus_id
+}
+
 # ---------------------------------------------------------------------------
 # Graph pipeline outputs (null when create_graph_store = false).
 # ---------------------------------------------------------------------------

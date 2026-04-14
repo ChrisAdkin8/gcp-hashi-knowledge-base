@@ -170,6 +170,34 @@ def _strip_layout_html(text: str) -> str:
     return text
 
 
+def _compress_code_blocks(text: str) -> str:
+    """Compress fenced code blocks by stripping comments and collapsing blank lines.
+
+    Targets HCL, JSON, YAML, and shell examples common in HashiCorp docs.
+    Preserves the code fence markers and language annotation.
+    """
+    def _compress_block(match: re.Match) -> str:
+        fence_open = match.group(1)   # e.g. ```hcl
+        code = match.group(2)
+        fence_close = match.group(3)  # ```
+
+        # Strip single-line comments (# and //) but keep shebang lines
+        code = re.sub(r'^(?!#!)[ \t]*(?:#|//)(?!\!).*\n?', '', code, flags=re.MULTILINE)
+        # Strip trailing inline comments (keep quoted strings safe by requiring whitespace before #)
+        code = re.sub(r'[ \t]+(?:#|//)[ \t]+[^\n]*$', '', code, flags=re.MULTILINE)
+        # Collapse runs of blank lines to a single blank line
+        code = re.sub(r'\n{3,}', '\n\n', code)
+
+        return f"{fence_open}{code}{fence_close}"
+
+    return re.sub(
+        r'(```[^\n]*\n)(.*?)(```)',
+        _compress_block,
+        text,
+        flags=re.DOTALL,
+    )
+
+
 # ── Semantic section splitting ────────────────────────────────────────────────
 
 
@@ -216,7 +244,7 @@ def split_into_sections(body: str) -> list[tuple[str, str]]:
     return sections if sections else [("", body.strip())]
 
 
-def _split_large_section(title: str, body: str, max_chars: int = 4000) -> list[tuple[str, str]]:
+def _split_large_section(title: str, body: str, max_chars: int = 2000) -> list[tuple[str, str]]:
     if len(body) <= max_chars:
         return [(title, body)]
 
@@ -312,7 +340,10 @@ def process_file(
     
     # ENHANCEMENT 1: Strip HTML tags
     body_stripped = _strip_layout_html(body_stripped)
-    
+
+    # ENHANCEMENT 6: Compress code blocks (strip comments, collapse blank lines)
+    body_stripped = _compress_code_blocks(body_stripped)
+
     # ENHANCEMENT 3: Collapse excessive blank lines to save tokens
     body_stripped = re.sub(r'\n{3,}', '\n\n', body_stripped)
     

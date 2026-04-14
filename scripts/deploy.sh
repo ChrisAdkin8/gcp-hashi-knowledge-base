@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # deploy.sh — End-to-end provisioning of the HashiCorp RAG pipeline.
 #
-# Runs three steps in sequence, each idempotent:
+# Runs four steps in sequence, each idempotent:
 #   1. Bootstrap GCS state bucket (skipped if already exists)
-#   2. Terraform apply (service account, IAM, GCS bucket, workflow, scheduler, Document AI)
-#   3. Trigger first pipeline run — the workflow auto-provisions the RAG corpus on this run
+#   2. Create (or find) the Vertex AI RAG corpus → write corpus.auto.tfvars
+#   3. Terraform apply (service account, IAM, GCS bucket, workflow, scheduler, Document AI)
+#   4. Trigger first pipeline run with the corpus ID
 #
-# The RAG corpus is NOT a Terraform resource. The workflow's setup_corpus step creates it
-# automatically on the first run (or any run where no matching corpus is found).
+# The RAG corpus is NOT a Terraform resource.  It is created once by
+# scripts/create_corpus.py (get-or-create) and its ID is passed to Terraform
+# via corpus.auto.tfvars so the scheduler always includes it in workflow args.
 #
 # The state bucket name is derived automatically from the project ID:
 #   <PROJECT_ID>-tf-state-<8-char hash>
@@ -19,7 +21,7 @@
 #     --repo-uri     https://github.com/org/repo
 #
 # Optional:
-#   --skip-pipeline    Skip step 3 (useful for infra-only re-runs).
+#   --skip-pipeline    Skip step 4 (useful for infra-only re-runs).
 #
 # Variables can also be supplied via env:
 #   GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_REGION
@@ -30,7 +32,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TF_DIR="${REPO_ROOT}/terraform"
 
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-}"
-REGION="${GOOGLE_CLOUD_REGION:-us-central1}"
+REGION="${GOOGLE_CLOUD_REGION:-us-west1}"
 REPO_URI=""
 SKIP_PIPELINE=false
 
@@ -65,15 +67,36 @@ export GOOGLE_CLOUD_QUOTA_PROJECT="${PROJECT_ID}"
 # ── Step 1: Bootstrap state bucket ────────────────────────────────────────────
 
 echo ""
-echo "=== [1/5] Bootstrap state bucket ==="
+echo "=== [1/4] Bootstrap state bucket ==="
 "${REPO_ROOT}/scripts/bootstrap_state.sh" \
   --project-id "${PROJECT_ID}" \
   --region     "${REGION}"
 
-# ── Step 2: Terraform apply (infrastructure) ─────────────────────────────────
+# ── Step 2: Create (or find) the RAG corpus ──────────────────────────────────
 
 echo ""
-echo "=== [2/3] Terraform apply (infrastructure) ==="
+echo "=== [2/4] Ensure RAG corpus exists ==="
+
+CORPUS_ID=$("${REPO_ROOT}/.venv/bin/python3" "${REPO_ROOT}/scripts/create_corpus.py" \
+  --project-id "${PROJECT_ID}" \
+  --region     "${REGION}" \
+  --output-id-only)
+
+if [[ -z "${CORPUS_ID}" ]]; then
+  echo "ERROR: Failed to create or find RAG corpus." >&2
+  exit 1
+fi
+echo "  Corpus ID: ${CORPUS_ID}"
+
+# Persist the corpus ID so Terraform (and the scheduler) always have it.
+CORPUS_TFVARS="${TF_DIR}/corpus.auto.tfvars"
+echo "corpus_id = \"${CORPUS_ID}\"" > "${CORPUS_TFVARS}"
+echo "  Wrote ${CORPUS_TFVARS}"
+
+# ── Step 3: Terraform apply (infrastructure) ─────────────────────────────────
+
+echo ""
+echo "=== [3/4] Terraform apply (infrastructure) ==="
 
 terraform -chdir="${TF_DIR}" init \
   -backend-config="bucket=${STATE_BUCKET}" \
@@ -100,22 +123,29 @@ echo ""
 echo "Waiting 90 s for IAM propagation before triggering the pipeline …"
 sleep 90
 
-# ── Step 3: Trigger first pipeline run ────────────────────────────────────────
-# The workflow's setup_corpus step will auto-provision the RAG corpus.
+# ── Step 4: Trigger first pipeline run ────────────────────────────────────────
 
 echo ""
 if [[ "${SKIP_PIPELINE}" == "true" ]]; then
-  echo "=== [3/3] Pipeline trigger skipped (--skip-pipeline) ==="
+  echo "=== [4/4] Pipeline trigger skipped (--skip-pipeline) ==="
 else
-  echo "=== [3/3] Trigger first pipeline run (corpus auto-provisioned by workflow) ==="
+  echo "=== [4/4] Trigger first pipeline run ==="
 
   SERVICE_ACCOUNT="projects/${PROJECT_ID}/serviceAccounts/rag-pipeline-sa@${PROJECT_ID}.iam.gserviceaccount.com"
-  WORKFLOW_DATA=$(python3 -c "
+  # Read repo URI from tfvars (source of truth Terraform just applied) rather
+  # than the CLI arg, so the manual trigger always matches the deployed scheduler.
+  APPLIED_REPO_URI=$(grep '^cloudbuild_repo_uri' "${TFVARS}" | sed 's/.*= *"\(.*\)"/\1/')
+  if [[ -z "${APPLIED_REPO_URI}" ]]; then
+    echo "WARNING: Could not read cloudbuild_repo_uri from ${TFVARS}, falling back to --repo-uri" >&2
+    APPLIED_REPO_URI="${REPO_URI}"
+  fi
+  WORKFLOW_DATA=$("${REPO_ROOT}/.venv/bin/python3" -c "
 import json
 print(json.dumps({
+  'corpus_id':       '${CORPUS_ID}',
   'bucket_name':     '${RAG_BUCKET}',
   'region':          '${REGION}',
-  'repo_url':        '${REPO_URI}',
+  'repo_url':        '${APPLIED_REPO_URI}',
   'service_account': '${SERVICE_ACCOUNT}',
 }))
 ")
@@ -134,10 +164,7 @@ echo "════════════════════════�
 echo "  RAG pipeline deployed successfully."
 echo "  RAG bucket   : gs://${RAG_BUCKET}"
 echo "  State bucket : gs://${STATE_BUCKET}"
-echo ""
-echo "  The corpus ID is set automatically by the workflow."
-echo "  To find it after the first run:"
-echo "    gcloud ai rag-corpora list --region=${REGION} --project=${PROJECT_ID}"
+echo "  Corpus ID    : ${CORPUS_ID}"
 echo ""
 echo "  To destroy all infrastructure:"
 echo "    task destroy"
