@@ -552,6 +552,41 @@ Key findings:
 - Overall token saving: **96%**
 - Cross-product queries show the largest absolute savings — instead of pasting multiple full documentation pages, the corpus retrieves the most relevant chunks across all sources in a single call.
 
+### Combined queries (RAG + Graph)
+
+Some questions require both documentation context (from the RAG corpus) and infrastructure structure (from the Spanner graph store). The `combined` mode runs queries that neither backend can fully answer alone — for example, auditing deployed IAM roles against HashiCorp least-privilege guidance, or verifying Spanner configuration against Terraform best practices.
+
+Each combined query issues a RAG retrieval for documentation and a graph lookup for structural data. The output shows a per-source token breakdown:
+
+| Query | RAG tokens | Graph tokens | Total | Raw tokens | Saving |
+|---|---|---|---|---|---|
+| IAM roles vs least-privilege guidance | — | — | — | 18,000 | — |
+| Service account security posture | — | — | — | 15,000 | — |
+| CI/CD pipeline structure and configuration | — | — | — | 17,000 | — |
+| Spanner deployment vs Terraform guidance | — | — | — | 14,000 | — |
+| Workflow orchestration design and implementation | — | — | — | 16,000 | — |
+| State backend storage and bucket configuration | — | — | — | 15,500 | — |
+
+> **Note:** RAG, graph, and total token columns show `—` until you run `task docs:token-efficiency MODE=combined` against a live environment. Raw token estimates are based on the equivalent manual sources (documentation pages + `.tf` file grepping + `terraform graph` output).
+
+Run the full benchmark:
+
+```bash
+# Combined mode (requires both corpus and Spanner)
+python3 scripts/test_token_efficiency.py \
+    --project-id <PROJECT_ID> --region <REGION> \
+    --corpus-id <CORPUS_ID> \
+    --spanner-instance <INSTANCE> --spanner-database <DATABASE> \
+    --mode combined
+
+# All modes (RAG + graph + combined + overall summary)
+python3 scripts/test_token_efficiency.py \
+    --project-id <PROJECT_ID> --region <REGION> \
+    --corpus-id <CORPUS_ID> \
+    --spanner-instance <INSTANCE> --spanner-database <DATABASE> \
+    --mode all
+```
+
 ---
 
 ## How to add new providers or modules

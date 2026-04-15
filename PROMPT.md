@@ -123,7 +123,7 @@ This prevents the same content from entering the corpus through multiple sources
     ├── setup_claude_vertex.sh          # Configure Claude Code for Vertex AI backend
     ├── setup_mcp.sh                    # Register MCP server with Claude Code settings
     ├── test_retrieval.py               # Validate corpus retrieval quality
-    └── test_token_efficiency.py        # Compare RAG token cost vs raw documentation
+    └── test_token_efficiency.py        # Compare token cost: RAG, graph, and combined (RAG+graph) vs raw sources
 ```
 
 ---
@@ -396,7 +396,14 @@ Registers the HashiCorp RAG MCP server with Claude Code by writing the `mcpServe
 
 ### scripts/test_token_efficiency.py
 
-Measures token efficiency of RAG retrieval versus pasting raw documentation into context. Runs cross-product queries (e.g., "Vault + Terraform provider", "Consul + Nomad scheduling") and compares tokens retrieved from the corpus (`top_k=3`, 1024-token chunks) against estimated tokens for equivalent full documentation pages. Outputs a per-query breakdown and a summary showing average token savings.
+Measures token efficiency of RAG retrieval, Spanner graph queries, and combined (RAG + graph) retrieval versus raw documentation and Terraform source files. Supports four modes:
+
+- **`rag`** — RAG-only queries against the Vertex AI corpus (e.g., "Vault + Terraform provider", "Consul + Nomad scheduling")
+- **`graph`** — Graph-only queries against the Spanner graph store (resource lookups by type, graph statistics)
+- **`combined`** — Queries that require answers from both backends (e.g., "What IAM roles exist and what does HashiCorp guidance say about least-privilege?"). Each combined query issues a RAG retrieval for documentation context and a graph lookup for structural data, then sums the tokens
+- **`all`** — Runs all three sections plus an overall summary
+
+Outputs a per-query breakdown (with RAG/graph token split for combined queries) and a summary table showing average token savings.
 
 ### cloudbuild/scripts/generate_metadata.py
 
@@ -576,6 +583,10 @@ Both use a dark theme (`#0a0a0f` background) with high-contrast colored lines an
 ## Token Efficiency
 
 The RAG corpus provides significant token savings compared to pasting raw documentation into LLM context windows. With `top_k=3` and 1024-token chunks, a typical retrieval returns 900–2,000 tokens of focused, relevant content — compared to 8,000–12,000+ tokens when pasting full documentation pages. At retrieval time, metadata header prefixes are stripped from chunks and near-identical content across different source documents is deduplicated by content fingerprint, further reducing token waste. For cross-product queries, the savings compound: a question spanning three products retrieves ~2,000 tokens from the corpus versus ~25,000 tokens from raw sources.
+
+The Spanner graph store adds a complementary efficiency layer: structured dependency lookups return compact tabular results (resource IDs, names, relationships) instead of requiring users to parse raw `.tf` files or `terraform graph` DOT output.
+
+Combined queries — questions that require both documentation context and infrastructure structure — demonstrate the largest practical benefit. For example, auditing IAM roles against least-privilege guidance requires both the deployed IAM bindings (graph) and HashiCorp best-practice documentation (RAG). The combined retrieval delivers focused answers from both backends while using a fraction of the tokens needed to manually assemble the equivalent raw sources.
 
 This efficiency gain is a direct consequence of the multi-stage optimisation pipeline: semantic pre-splitting with code block compression at ingestion, minimal chunk overlap (20 tokens), larger chunk size (1024 tokens) matching pre-split sections, semantic reranking at retrieval, per-document and cross-document content deduplication, metadata header stripping, and a compact output format that minimises framing overhead.
 

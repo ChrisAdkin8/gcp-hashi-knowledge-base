@@ -174,6 +174,131 @@ BUILTIN_GRAPH_QUERIES: list[dict] = [
     },
 ]
 
+# Combined queries require answers from BOTH the RAG corpus (documentation)
+# AND the Spanner graph store (infrastructure structure/dependencies).
+# Each entry has a natural-language query for RAG plus a graph lookup that
+# contributes structural context the docs alone cannot provide.
+BUILTIN_COMBINED_QUERIES: list[dict] = [
+    {
+        "topic": "IAM roles vs least-privilege guidance",
+        "rag_query": (
+            "What are the best practices for granting IAM roles to service "
+            "accounts in Google Cloud Terraform projects?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_project_iam_member",
+        },
+        "why_combined": (
+            "RAG provides HashiCorp best-practice guidance; graph shows which "
+            "IAM bindings actually exist so the answer can flag over-permissioned roles"
+        ),
+        "raw_sources": (
+            "Terraform GCP IAM docs + Vault identity docs + grep all .tf for IAM blocks"
+        ),
+        "raw_tokens_estimate": 18000,
+    },
+    {
+        "topic": "Service account security posture",
+        "rag_query": (
+            "How should service accounts be secured and rotated according to "
+            "HashiCorp Vault and Terraform best practices?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_service_account",
+        },
+        "why_combined": (
+            "RAG returns Vault secret-rotation and Terraform SA docs; graph "
+            "lists the actual service accounts deployed so the answer is grounded"
+        ),
+        "raw_sources": (
+            "Vault GCP secrets engine docs + Terraform SA resource docs + grep .tf files"
+        ),
+        "raw_tokens_estimate": 15000,
+    },
+    {
+        "topic": "CI/CD pipeline structure and configuration",
+        "rag_query": (
+            "How should Cloud Build triggers be configured in Terraform for a "
+            "CI/CD pipeline following HashiCorp recommended patterns?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_cloudbuild_trigger",
+        },
+        "why_combined": (
+            "RAG provides Terraform CI/CD pattern docs; graph reveals the "
+            "actual trigger resources and their dependency chain"
+        ),
+        "raw_sources": (
+            "Terraform Cloud Build docs + HCP Terraform run-task docs + "
+            "grep .tf files + terraform graph output"
+        ),
+        "raw_tokens_estimate": 17000,
+    },
+    {
+        "topic": "Spanner deployment vs Terraform database guidance",
+        "rag_query": (
+            "What does HashiCorp documentation recommend for managing Spanner "
+            "instances and databases with Terraform, including edition selection?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_spanner_instance",
+        },
+        "why_combined": (
+            "RAG covers Terraform Spanner resource docs and edition guidance; "
+            "graph shows the actual deployed Spanner resources for comparison"
+        ),
+        "raw_sources": (
+            "Terraform google_spanner_instance docs + google_spanner_database docs "
+            "+ grep .tf files for spanner blocks"
+        ),
+        "raw_tokens_estimate": 14000,
+    },
+    {
+        "topic": "Workflow orchestration design and implementation",
+        "rag_query": (
+            "How should Cloud Workflows and Cloud Scheduler be configured in "
+            "Terraform to orchestrate a data pipeline?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_workflows_workflow",
+        },
+        "why_combined": (
+            "RAG provides Terraform orchestration pattern docs; graph reveals "
+            "the deployed workflow resources and their dependencies"
+        ),
+        "raw_sources": (
+            "Terraform Cloud Workflows docs + Cloud Scheduler docs + grep .tf "
+            "files + terraform graph output"
+        ),
+        "raw_tokens_estimate": 16000,
+    },
+    {
+        "topic": "State backend storage and bucket configuration",
+        "rag_query": (
+            "What are Terraform best practices for configuring GCS buckets as "
+            "remote state backends, including versioning and locking?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_storage_bucket",
+        },
+        "why_combined": (
+            "RAG returns Terraform state backend docs; graph shows the actual "
+            "GCS buckets deployed so the answer can verify the backend setup"
+        ),
+        "raw_sources": (
+            "Terraform GCS backend docs + state locking page + versioning docs "
+            "+ grep .tf files for bucket resources"
+        ),
+        "raw_tokens_estimate": 15500,
+    },
+]
+
 
 def count_tokens(text: str) -> int:
     """Count tokens using tiktoken if available, else estimate from words.
@@ -242,12 +367,15 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
-    needs_rag = args.mode in ("rag", "combined", "all")
-    needs_graph = args.mode in ("graph", "combined", "all")
+    needs_rag = args.mode in ("rag", "all")
+    needs_graph = args.mode in ("graph", "all")
+    needs_combined = args.mode in ("combined", "all")
 
-    if needs_rag and not args.corpus_id:
+    if (needs_rag or needs_combined) and not args.corpus_id:
         parser.error("--corpus-id is required for mode '%s'" % args.mode)
-    if needs_graph and (not args.spanner_instance or not args.spanner_database):
+    if (needs_graph or needs_combined) and (
+        not args.spanner_instance or not args.spanner_database
+    ):
         parser.error(
             "--spanner-instance and --spanner-database are required for mode '%s'"
             % args.mode
@@ -516,6 +644,83 @@ def run_graph_tests(args: argparse.Namespace) -> list[dict]:
     return results
 
 
+def run_combined_tests(args: argparse.Namespace) -> list[dict]:
+    """Run combined tests that query both RAG and graph for each prompt.
+
+    Each combined query retrieves documentation context from the RAG corpus
+    and structural/dependency data from the Spanner graph, then merges the
+    token counts to show the cost of answering a question that requires both.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        List of result dicts.
+    """
+    results: list[dict] = []
+    for item in BUILTIN_COMBINED_QUERIES:
+        topic = item["topic"]
+        raw_estimate = item["raw_tokens_estimate"]
+        rag_tokens = 0
+        graph_tokens = 0
+        rag_chunks = 0
+        graph_rows = 0
+        error_parts: list[str] = []
+
+        # RAG retrieval
+        try:
+            rag_text, rag_chunks = retrieve_from_corpus(
+                project_id=args.project_id,
+                region=args.region,
+                corpus_id=args.corpus_id,
+                query_text=item["rag_query"],
+                top_k=args.top_k,
+                distance_threshold=args.distance_threshold,
+            )
+            rag_tokens = count_tokens(rag_text) if rag_text else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Combined RAG query '%s' failed: %s", topic, exc)
+            error_parts.append(f"RAG: {exc}")
+
+        # Graph retrieval
+        try:
+            graph_text, graph_rows = retrieve_from_graph(
+                project_id=args.project_id,
+                spanner_instance=args.spanner_instance,
+                spanner_database=args.spanner_database,
+                query_item=item["graph_query"],
+            )
+            graph_tokens = count_tokens(graph_text) if graph_text else 0
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Combined graph query '%s' failed: %s", topic, exc)
+            error_parts.append(f"Graph: {exc}")
+
+        total_tokens = rag_tokens + graph_tokens
+        total_chunks = rag_chunks + graph_rows
+        saving_pct = (
+            ((raw_estimate - total_tokens) / raw_estimate) * 100
+            if raw_estimate > 0 and total_tokens > 0
+            else 0.0
+        )
+        results.append(
+            {
+                "topic": f"[Combined] {topic}",
+                "chunks": total_chunks,
+                "retrieval_tokens": total_tokens,
+                "rag_tokens": rag_tokens,
+                "graph_tokens": graph_tokens,
+                "rag_chunks": rag_chunks,
+                "graph_rows": graph_rows,
+                "raw_tokens": raw_estimate,
+                "saving_pct": saving_pct,
+                "raw_sources": item["raw_sources"],
+                "why_combined": item["why_combined"],
+                "error": "; ".join(error_parts) if error_parts else None,
+            }
+        )
+    return results
+
+
 def print_results(results: list[dict], label: str) -> None:
     """Print per-query results and summary table.
 
@@ -531,6 +736,11 @@ def print_results(results: list[dict], label: str) -> None:
             continue
         print(f"  Rows/chunks retrieved : {r['chunks']}")
         print(f"  Retrieval tokens      : {r['retrieval_tokens']:,}")
+        if "rag_tokens" in r:
+            print(f"    ├─ RAG tokens       : {r['rag_tokens']:,}  ({r['rag_chunks']} chunks)")
+            print(f"    └─ Graph tokens     : {r['graph_tokens']:,}  ({r['graph_rows']} rows)")
+        if r.get("why_combined"):
+            print(f"  Why combined          : {r['why_combined']}")
         if r["raw_tokens"] > 0:
             print(f"  Raw tokens estimate   : {r['raw_tokens']:,}  ({r['raw_sources']})")
             print(f"  Token saving          : {r['saving_pct']:.0f}%")
@@ -588,8 +798,9 @@ def main() -> None:
     """Entry point."""
     args = parse_args()
 
-    needs_rag = args.mode in ("rag", "combined", "all")
-    needs_graph = args.mode in ("graph", "combined", "all")
+    needs_rag = args.mode in ("rag", "all")
+    needs_graph = args.mode in ("graph", "all")
+    needs_combined = args.mode in ("combined", "all")
 
     try:
         import tiktoken  # noqa: F401
@@ -602,11 +813,11 @@ def main() -> None:
     print(f"{'=' * 72}")
     print(f"Project   : {args.project_id}")
     print(f"Region    : {args.region}")
-    if needs_rag:
+    if needs_rag or needs_combined:
         print(f"Corpus    : {args.corpus_id}")
         print(f"Top-K     : {args.top_k}")
         print(f"Threshold : {args.distance_threshold}")
-    if needs_graph:
+    if needs_graph or needs_combined:
         print(f"Spanner   : {args.spanner_instance}/{args.spanner_database}")
     print(f"Tokeniser : {tokeniser}")
     print()
@@ -630,9 +841,17 @@ def main() -> None:
         all_results.extend(graph_results)
         print_results(graph_results, "Graph")
 
-    # Combined summary when both ran
-    if needs_rag and needs_graph:
-        print_results(all_results, "Combined (RAG + Graph)")
+    if needs_combined:
+        print(f"\n{'=' * 72}")
+        print("COMBINED QUERIES (require both RAG + Graph)")
+        print(f"{'=' * 72}\n")
+        combined_results = run_combined_tests(args)
+        all_results.extend(combined_results)
+        print_results(combined_results, "Combined (RAG + Graph)")
+
+    # Overall summary when multiple sections ran
+    if sum([needs_rag, needs_graph, needs_combined]) > 1:
+        print_results(all_results, "All")
 
     valid = [r for r in all_results if not r["error"] and r["raw_tokens"] > 0]
     if not valid:
