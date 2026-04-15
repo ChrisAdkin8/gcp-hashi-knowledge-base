@@ -589,6 +589,16 @@ python3 scripts/test_token_efficiency.py \
     --corpus-id <CORPUS_ID> \
     --spanner-instance <INSTANCE> --spanner-database <DATABASE> \
     --mode all
+
+# Add --verbose for per-query detail (rows/chunks, token breakdowns, raw sources)
+python3 scripts/test_token_efficiency.py \
+    --project-id <PROJECT_ID> --region <REGION> \
+    --corpus-id <CORPUS_ID> \
+    --spanner-instance <INSTANCE> --spanner-database <DATABASE> \
+    --mode all --verbose
+
+# Or via Taskfile
+task test:token-efficiency MODE=all VERBOSE=true
 ```
 
 ---

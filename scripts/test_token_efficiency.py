@@ -448,6 +448,12 @@ def parse_args() -> argparse.Namespace:
         help="Run a single custom query instead of the built-in suite.",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Show per-query detail. Default: only tables and summary.",
+    )
+    parser.add_argument(
         "--top-k",
         type=int,
         default=3,
@@ -815,30 +821,32 @@ def run_combined_tests(args: argparse.Namespace) -> list[dict]:
     return results
 
 
-def print_results(results: list[dict], label: str) -> None:
+def print_results(results: list[dict], label: str, *, verbose: bool = False) -> None:
     """Print per-query results and summary table.
 
     Args:
         results: List of result dicts.
         label: Section label (e.g. "RAG", "Graph", "All").
+        verbose: If True, show per-query detail before the summary table.
     """
-    # ── Per-query results ────────────────────────────────────────────────
-    for r in results:
-        print(f"── {r['topic']} {'─' * max(1, 56 - len(r['topic']))}")
-        if r["error"]:
-            print(f"  ERROR: {r['error']}")
-            continue
-        print(f"  Rows/chunks retrieved : {r['chunks']}")
-        print(f"  Retrieval tokens      : {r['retrieval_tokens']:,}")
-        if "rag_tokens" in r:
-            print(f"    ├─ RAG tokens       : {r['rag_tokens']:,}  ({r['rag_chunks']} chunks)")
-            print(f"    └─ Graph tokens     : {r['graph_tokens']:,}  ({r['graph_rows']} rows)")
-        if r.get("why_combined"):
-            print(f"  Why combined          : {r['why_combined']}")
-        if r["raw_tokens"] > 0:
-            print(f"  Raw tokens estimate   : {r['raw_tokens']:,}  ({r['raw_sources']})")
-            print(f"  Token saving          : {r['saving_pct']:.0f}%")
-        print()
+    # ── Per-query results (verbose only) ─────────────────────────────────
+    if verbose:
+        for r in results:
+            print(f"── {r['topic']} {'─' * max(1, 56 - len(r['topic']))}")
+            if r["error"]:
+                print(f"  ERROR: {r['error']}")
+                continue
+            print(f"  Rows/chunks retrieved : {r['chunks']}")
+            print(f"  Retrieval tokens      : {r['retrieval_tokens']:,}")
+            if "rag_tokens" in r:
+                print(f"    ├─ RAG tokens       : {r['rag_tokens']:,}  ({r['rag_chunks']} chunks)")
+                print(f"    └─ Graph tokens     : {r['graph_tokens']:,}  ({r['graph_rows']} rows)")
+            if r.get("why_combined"):
+                print(f"  Why combined          : {r['why_combined']}")
+            if r["raw_tokens"] > 0:
+                print(f"  Raw tokens estimate   : {r['raw_tokens']:,}  ({r['raw_sources']})")
+                print(f"  Token saving          : {r['saving_pct']:.0f}%")
+            print()
 
     # ── Summary table ────────────────────────────────────────────────────
     valid = [r for r in results if not r["error"] and r["raw_tokens"] > 0]
@@ -919,33 +927,38 @@ def main() -> None:
     all_results: list[dict] = []
     has_failure = False
 
+    verbose = args.verbose
+
     if needs_rag:
-        print(f"\n{'=' * 72}")
-        print("RAG CORPUS QUERIES")
-        print(f"{'=' * 72}\n")
+        if verbose:
+            print(f"\n{'=' * 72}")
+            print("RAG CORPUS QUERIES")
+            print(f"{'=' * 72}\n")
         rag_results = run_rag_tests(args)
         all_results.extend(rag_results)
-        print_results(rag_results, "RAG")
+        print_results(rag_results, "RAG", verbose=verbose)
 
     if needs_graph:
-        print(f"\n{'=' * 72}")
-        print("GRAPH STORE QUERIES")
-        print(f"{'=' * 72}\n")
+        if verbose:
+            print(f"\n{'=' * 72}")
+            print("GRAPH STORE QUERIES")
+            print(f"{'=' * 72}\n")
         graph_results = run_graph_tests(args)
         all_results.extend(graph_results)
-        print_results(graph_results, "Graph")
+        print_results(graph_results, "Graph", verbose=verbose)
 
     if needs_combined:
-        print(f"\n{'=' * 72}")
-        print("COMBINED QUERIES (require both RAG + Graph)")
-        print(f"{'=' * 72}\n")
+        if verbose:
+            print(f"\n{'=' * 72}")
+            print("COMBINED QUERIES (require both RAG + Graph)")
+            print(f"{'=' * 72}\n")
         combined_results = run_combined_tests(args)
         all_results.extend(combined_results)
-        print_results(combined_results, "Combined (RAG + Graph)")
+        print_results(combined_results, "Combined (RAG + Graph)", verbose=verbose)
 
     # Overall summary when multiple sections ran
     if sum([needs_rag, needs_graph, needs_combined]) > 1:
-        print_results(all_results, "All")
+        print_results(all_results, "All", verbose=verbose)
 
     valid = [r for r in all_results if not r["error"] and r["raw_tokens"] > 0]
     if not valid:

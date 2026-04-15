@@ -403,7 +403,7 @@ Measures token efficiency of RAG retrieval, Spanner graph queries, and combined 
 - **`combined`** — Queries that require answers from both backends (e.g., "What IAM roles exist and what does HashiCorp guidance say about least-privilege?"). Each combined query issues a RAG retrieval for documentation context and a graph lookup for structural data, then sums the tokens
 - **`all`** — Runs all three sections plus an overall summary
 
-Outputs a per-query breakdown (with RAG/graph token split for combined queries) and a summary table showing average token savings.
+By default, outputs only the summary tables and key findings. Pass `--verbose` to include per-query detail (rows/chunks, token breakdowns, raw source estimates, and combined-query rationale).
 
 ### cloudbuild/scripts/generate_metadata.py
 

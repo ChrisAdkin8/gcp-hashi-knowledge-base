@@ -242,6 +242,7 @@ tasks:
           [[ -n "$SI" && -n "$SD" ]] || { echo "Error: Spanner required for mode '$MODE'."; exit 1; }
           ARGS+=" --spanner-instance $SI --spanner-database $SD"
         }
+        [[ "{{.VERBOSE | default ""}}" != "true" ]] || ARGS+=" --verbose"
         {{.PYTHON}} scripts/test_token_efficiency.py $ARGS
 
   # ── Preflight ──────────────────────────────────────────────────────
