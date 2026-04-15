@@ -167,6 +167,20 @@ BUILTIN_GRAPH_QUERIES: list[dict] = [
         "raw_tokens_estimate": 3500,
     },
     {
+        "topic": "Vertex AI RAG corpus resources",
+        "query_type": "find_by_type",
+        "resource_type": "google_vertex_ai_rag_corpus",
+        "raw_sources": "grep .tf files for vertex_ai blocks + terraform state list",
+        "raw_tokens_estimate": 3000,
+    },
+    {
+        "topic": "Pub/Sub topic resources",
+        "query_type": "find_by_type",
+        "resource_type": "google_pubsub_topic",
+        "raw_sources": "grep .tf files for pubsub blocks + terraform state list",
+        "raw_tokens_estimate": 3500,
+    },
+    {
         "topic": "Graph statistics overview",
         "query_type": "graph_info",
         "raw_sources": "terraform state list | wc -l + terraform graph | dot analysis",
@@ -296,6 +310,86 @@ BUILTIN_COMBINED_QUERIES: list[dict] = [
             "+ grep .tf files for bucket resources"
         ),
         "raw_tokens_estimate": 15500,
+    },
+    {
+        "topic": "Scheduler-driven workflow orchestration patterns",
+        "rag_query": (
+            "What are HashiCorp best practices for using Cloud Scheduler to "
+            "trigger Cloud Workflows in a Terraform-managed pipeline?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_cloud_scheduler_job",
+        },
+        "why_combined": (
+            "RAG provides Terraform scheduler and workflow docs; graph shows "
+            "the actual scheduler jobs and their trigger targets"
+        ),
+        "raw_sources": (
+            "Terraform Cloud Scheduler docs + Cloud Workflows docs + "
+            "grep .tf files for scheduler_job blocks"
+        ),
+        "raw_tokens_estimate": 14500,
+    },
+    {
+        "topic": "Pub/Sub event-driven architecture",
+        "rag_query": (
+            "How should Pub/Sub topics and subscriptions be configured in "
+            "Terraform for event-driven data pipelines?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_pubsub_topic",
+        },
+        "why_combined": (
+            "RAG returns Terraform Pub/Sub resource docs and event-driven "
+            "patterns; graph reveals the deployed topics and their dependencies"
+        ),
+        "raw_sources": (
+            "Terraform google_pubsub_topic docs + google_pubsub_subscription docs "
+            "+ grep .tf files for pubsub blocks"
+        ),
+        "raw_tokens_estimate": 13000,
+    },
+    {
+        "topic": "Vault-managed secrets for GCP service accounts",
+        "rag_query": (
+            "How does HashiCorp Vault integrate with GCP to dynamically "
+            "generate service account keys using the GCP secrets engine?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_service_account",
+        },
+        "why_combined": (
+            "RAG provides Vault GCP secrets engine documentation; graph shows "
+            "which service accounts exist to validate rotation coverage"
+        ),
+        "raw_sources": (
+            "Vault GCP secrets engine docs + Terraform SA docs + "
+            "grep .tf files for service_account resources"
+        ),
+        "raw_tokens_estimate": 16500,
+    },
+    {
+        "topic": "RAG corpus ingestion and Vertex AI configuration",
+        "rag_query": (
+            "How should a Vertex AI RAG corpus be configured and populated "
+            "with documents using Terraform and Python automation?"
+        ),
+        "graph_query": {
+            "query_type": "find_by_type",
+            "resource_type": "google_storage_bucket",
+        },
+        "why_combined": (
+            "RAG returns Vertex AI RAG API docs and ingestion patterns; graph "
+            "shows the GCS buckets used for document staging"
+        ),
+        "raw_sources": (
+            "Vertex AI RAG Engine docs + Terraform GCS bucket docs + "
+            "grep .tf files + scripts/create_corpus.py"
+        ),
+        "raw_tokens_estimate": 19000,
     },
 ]
 

@@ -566,6 +566,10 @@ Each combined query issues a RAG retrieval for documentation and a graph lookup 
 | Spanner deployment vs Terraform guidance | — | — | — | 14,000 | — |
 | Workflow orchestration design and implementation | — | — | — | 16,000 | — |
 | State backend storage and bucket configuration | — | — | — | 15,500 | — |
+| Scheduler-driven workflow orchestration patterns | — | — | — | 14,500 | — |
+| Pub/Sub event-driven architecture | — | — | — | 13,000 | — |
+| Vault-managed secrets for GCP service accounts | — | — | — | 16,500 | — |
+| RAG corpus ingestion and Vertex AI configuration | — | — | — | 19,000 | — |
 
 > **Note:** RAG, graph, and total token columns show `—` until you run `task docs:token-efficiency MODE=combined` against a live environment. Raw token estimates are based on the equivalent manual sources (documentation pages + `.tf` file grepping + `terraform graph` output).
 
